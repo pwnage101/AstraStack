@@ -50,6 +50,15 @@ Building primarily uses pyinstaller to package into an executable.
 
 The project can also be built in Windows using a mingw64 installation.  You can install the python packages via the pacman package manager that it comes with, as well as with pip.  Inno Setup is also used to create an installer file.
 
+## Unit Testing
+
+Unit tests use `pytest` and live under `tests/`. They need no display and run
+in about a second:
+
+```
+python -m pytest
+```
+
 ## End-To-End Testing
 
 E2E testing leverages the `behave` framework to simulate Gtk actions in the UI.
