@@ -2,10 +2,13 @@ from lazy import lazy
 cv2 = lazy("cv2")
 np = lazy("numpy")
 rawpy = lazy("rawpy")
+av = lazy("av")
 import math
 from concurrent.futures.process import BrokenProcessPool
 from Globals import *
 from ProgressBar import *
+import ColorSpace
+import Lens
 
 class Video:
 
@@ -24,42 +27,122 @@ class Video:
     def __init__(self):
         self.frames = []
         self.sharpest = 0
-        self.vidcap = None
         self.sharps = []
         self.deltas = []
+        self.colorSpace = None
+        self.colorSpaceMismatch = False
+        self.container = None
         
     @staticmethod
     # Reads an image file
     def readImage(file, flags=cv2.IMREAD_COLOR, dtype=np.uint16, thumbnail=False):
+        return Video.decodeImage(file, flags, dtype, thumbnail, describe=False)[0]
+        
+    @staticmethod
+    # Reads an image file and its color description (None when it has none or describe is False)
+    def decodeImage(file, flags=cv2.IMREAD_COLOR, dtype=np.uint16, thumbnail=False, describe=True):
+        img = None
         try:
-            # First see if its a raw file
+            # First see if its a raw file, decoded linear in camera RGB
             with rawpy.imread(file) as raw:
-                bps = 8
-                if(dtype == np.uint16):
-                    bps = 16
-                img = raw.postprocess(half_size=thumbnail, output_bps=bps)
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                return img
-        except:
-            img = cv2.imread(file, flags)
-            if(img is not None):
-                # Normal img, so return
-                return img
-            else:
-                # Image might be a FITS image so give that a try
-                from astropy.io import fits
-                img = fits.getdata(file)
-                maxVal = 1
-                try:
-                    maxVal = np.iinfo(img.dtype).max
-                except:
-                    pass
-                img = (img.astype(np.float32)/maxVal)*np.iinfo(dtype).max
-                cv2.normalize(img, img, alpha=0, beta=np.iinfo(dtype).max, norm_type=cv2.NORM_MINMAX)
-                img = img.astype(dtype)
-                if(flags == cv2.IMREAD_COLOR):
-                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            return img
+                img = raw.postprocess(half_size=thumbnail, output_color=rawpy.ColorSpace.raw, gamma=(1, 1),
+                                      no_auto_bright=True, use_camera_wb=True, output_bps=16)
+                colorSpace = ColorSpace.fromRAW(raw) if describe else None
+        except Exception:
+            pass
+        if(img is not None):
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            if(dtype == np.uint8):
+                img = (img >> 8).astype(np.uint8)
+            return (img, colorSpace)
+        img = cv2.imread(file, flags)
+        if(img is not None):
+            # Normal img
+            if(describe):
+                return ColorSpace.describeImage(file, img)
+            return (img, None)
+        else:
+            # Image might be a FITS image so give that a try
+            from astropy.io import fits
+            img = fits.getdata(file)
+            maxVal = 1
+            try:
+                maxVal = np.iinfo(img.dtype).max
+            except:
+                pass
+            img = (img.astype(np.float32)/maxVal)*np.iinfo(dtype).max
+            cv2.normalize(img, img, alpha=0, beta=np.iinfo(dtype).max, norm_type=cv2.NORM_MINMAX)
+            img = img.astype(dtype)
+            if(flags == cv2.IMREAD_COLOR):
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        return (img, None)
+        
+    # Opens the video with PyAV
+    def openVideo(self, file):
+        self.container = av.open(file)
+        self.stream = self.container.streams.video[0]
+        codec = self.stream.codec_context
+        self.width, self.height = codec.width, codec.height
+        self.videoBits = 8
+        if(codec.format is not None):
+            self.videoBits = codec.format.components[0].bits
+        self.videoColorSpace = ColorSpace.fromCICP(codec.color_primaries, codec.color_trc)
+        self.decoder = None
+        self.lastPts = None
+        self.lastFrame = None
+        
+    # Returns the time (ms) of the pts
+    def videoTime(self, pts):
+        return float(pts*self.stream.time_base*1000)
+        
+    # Returns the times (ms) of the video's frames, read from the packets so nothing is decoded
+    def videoFrameTimes(self):
+        pts = set()
+        for packet in self.container.demux(self.stream):
+            p = packet.pts if packet.pts is not None else packet.dts
+            if(p is not None and packet.size > 0):
+                pts.add(p)
+        self.decoder = None
+        return [self.videoTime(p) for p in sorted(pts)]
+        
+    # Converts the decoded frame to BGR (rgb24 = 8-bit, rgb48le = 16-bit) with the stream's YUV -> RGB matrix and range
+    def videoFrameToImage(self, videoFrame, format):
+        matrix = {1: "ITU709", 4: "FCC", 5: "ITU601", 6: "ITU601", 7: "SMPTE240M", 9: "BT2020", 10: "BT2020"}.get(videoFrame.colorspace)
+        if(matrix is None):
+            # Untagged, guess like most players
+            matrix = "ITU709" if videoFrame.height >= 720 else "ITU601"
+        colorRange = {1: "MPEG", 2: "JPEG"}.get(videoFrame.color_range)
+        if(colorRange is None):
+            # Untagged, YUV is usually limited range
+            isYUV = (not videoFrame.format.is_rgb and len(videoFrame.format.components) >= 3)
+            colorRange = "MPEG" if isYUV and not videoFrame.format.name.startswith("yuvj") else "JPEG"
+        # One thread, swscale's thread pool deadlocks in processes forked after it was used
+        image = videoFrame.reformat(format=format, src_colorspace=matrix, src_color_range=colorRange, dst_color_range="JPEG", threads=1).to_ndarray()
+        return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        
+    # Decodes the video frame at the time (ms) or the first one after it, returns it as BGR and the video's color description
+    def readVideoFrame(self, file, time, format="rgb48le"):
+        if(self.container is None):
+            self.openVideo(file)
+        target = int(round(time/1000/self.stream.time_base))
+        if(self.lastFrame is None or target != self.lastPts):
+            if(self.decoder is None or self.lastPts is None or target < self.lastPts or 
+               target - self.lastPts > 1/self.stream.time_base):
+                # Seek unless the frame is less than a second ahead
+                self.container.seek(target, stream=self.stream, backward=True)
+                self.decoder = self.container.decode(self.stream)
+            self.lastFrame = None
+            for videoFrame in self.decoder:
+                pts = videoFrame.pts if videoFrame.pts is not None else videoFrame.dts
+                if(pts is not None and pts >= target):
+                    self.lastPts = pts
+                    self.lastFrame = videoFrame
+                    break
+            if(self.lastFrame is None):
+                self.decoder = None
+                raise EOFError("No video frame at " + str(time) + " ms")
+        self.lastTime = self.videoTime(self.lastPts)
+        return (self.videoFrameToImage(self.lastFrame, format), self.videoColorSpace)
             
     # Checks to see if there will be enough memory to process the image
     def checkMemory(self):
@@ -70,10 +153,9 @@ class Video:
                 raise MemoryError()
         else:
             # Video
-            vidcap = cv2.VideoCapture(g.file)
-            width  = vidcap.get(cv2.CAP_PROP_FRAME_WIDTH)
-            height = vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-            vidcap.release()
+            with av.open(g.file) as container:
+                codec = container.streams.video[0].codec_context
+                width, height = codec.width, codec.height
             if(not g.ui.checkMemory(w=width,h=height)):
                 raise MemoryError()
 
@@ -92,50 +174,43 @@ class Video:
                 g.guessedColorMode = self.guessColorMode(g.file)
                 
                 progress.setMessage("Preprocessing Frames")
-                height, width = Video.readImage(g.file[0]).shape[:2]
+                image, g.colorSpace = Video.decodeImage(g.file[0])
+                g.colorSpaceFromImage = True
+                height, width = image.shape[:2]
+                self.width, self.height = width, height
+                spaces = []
                 for i in range(0, g.nThreads):
                     futures.append(g.pool.submit(loadFramesSequence, g.file[max(0, (i*countPerThread)-1):(i+1)*countPerThread], i, width, height, g.actualColor(), ProgressCounter(progress.counter(i), g.nThreads)))
                 for i in range(0, g.nThreads):
-                    frames, sharp, deltas = futures[i].result()
+                    frames, sharp, deltas, colorSpaces = futures[i].result()
                     self.frames += frames
                     self.sharps += sharp
                     self.deltas += deltas
+                    spaces += colorSpaces
+                    
+                # The first image's color space is used for all of them
+                self.colorSpaceMismatch = any(not ColorSpace.same(colorSpace, g.colorSpace) for colorSpace in spaces)
             else:
                 # Video
-                self.vidcap = cv2.VideoCapture(g.file)
-                progress.total = int(self.vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-                frameTime = (1000/self.vidcap.get(cv2.CAP_PROP_FPS))
+                self.openVideo(g.file)
+                times = self.videoFrameTimes()
+                progress.total = len(times)
+                g.colorSpace = self.videoColorSpace
+                g.colorSpaceFromImage = False
 
                 g.guessedColorMode = self.guessColorMode(g.file)
                 
                 progress.setMessage("Preprocessing Frames")
                 countPerThread = math.ceil(progress.total/g.nThreads)
                 for i in range(0, g.nThreads):
-                    futures.append(g.pool.submit(loadFramesVideo, g.file, i*countPerThread, countPerThread, g.actualColor(), ProgressCounter(progress.counter(i), g.nThreads)))
+                    start = i*countPerThread
+                    previous = times[start-1] if start > 0 and start <= len(times) else None
+                    futures.append(g.pool.submit(loadFramesVideo, g.file, times[start:start+countPerThread], previous, g.actualColor(), ProgressCounter(progress.counter(i), g.nThreads)))
                 for i in range(0, g.nThreads):
-                    frames, sharp, deltas, wScaleFactor, hScaleFactor = futures[i].result()
+                    frames, sharp, deltas = futures[i].result()
                     self.frames += frames
                     self.sharps += sharp
                     self.deltas += deltas
-                    
-                framesDict = dict()
-                tmpFrames = []
-                tmpSharps = []
-                tmpDeltas = []
-                for i, frame in enumerate(self.frames):
-                    # Work-around for https://github.com/opencv/opencv/issues/20550
-                    if(i > 0 and frame == 0):
-                        frame = tmpFrames[-1] + frameTime
-                    
-                    # Some videos are weird with their frame timings, so get rid of possible duplicates
-                    if(frame not in framesDict):
-                        framesDict[frame] = True
-                        tmpFrames.append(frame)
-                        tmpSharps.append(self.sharps[i])
-                        tmpDeltas.append(self.deltas[i])
-                self.sharps = tmpSharps
-                self.frames = tmpFrames
-                self.deltas = tmpDeltas
                 
         except BrokenProcessPool:
             progress.stop()
@@ -149,33 +224,48 @@ class Video:
         progress.stop()
         g.ui.finishedVideo()
         
-    def getFrame(self, file, frame, colorMode, dtype=np.uint16, thumbnail=False):
-        if(isinstance(frame, str)):
-            # Specific file
-            image = Video.readImage(frame, cv2.IMREAD_UNCHANGED, dtype, thumbnail)
+    # Returns the frame as linear float32 (0-1, BGR), its color description is stored in self.colorSpace
+    # lens (Lens.LensCorrection) corrects the lens distortion, TCA and vignetting
+    def getFrame(self, file, frame, colorMode, dtype=np.uint16, thumbnail=False, lens=None):
+        if(isinstance(frame, str) or isinstance(file, list)):
+            # Specific file or Image Sequence
+            if(not isinstance(frame, str)):
+                frame = file[frame]
+            image, colorSpace = Video.decodeImage(frame, cv2.IMREAD_UNCHANGED, dtype, thumbnail)
             if(colorMode == Video.COLOR_AUTO):
                 colorMode = self.guessColorMode(file, image=image)
-            image = Video.colorMode(image, colorMode)
-            image = (image.astype(np.float32)/np.iinfo(image.dtype).max)*255
-        elif(isinstance(file, list)):
-            # Image Sequence
-            image = Video.readImage(file[frame], cv2.IMREAD_UNCHANGED, dtype, thumbnail)
-            if(colorMode == Video.COLOR_AUTO):
-                colorMode = self.guessColorMode(file, image=image)
-            image = Video.colorMode(image, colorMode)
-            image = (image.astype(np.float32)/np.iinfo(image.dtype).max)*255
         else:
             # Video
-            if(self.vidcap is None):
-                self.vidcap = cv2.VideoCapture(file)
-            frameTime = ((1000/self.vidcap.get(cv2.CAP_PROP_FPS))+0.1)
-            lastTime = self.vidcap.get(cv2.CAP_PROP_POS_MSEC)
-            if(not (frame < lastTime + frameTime and frame > lastTime)):
-                self.vidcap.set(cv2.CAP_PROP_POS_MSEC, frame)
-            success,image = self.vidcap.read()
+            image, colorSpace = self.readVideoFrame(file, frame)
             if(colorMode == Video.COLOR_AUTO):
                 colorMode = self.guessColorMode(file, image=image)
-            image = Video.colorMode(image, colorMode)
+            if(colorMode >= Video.COLOR_RGGB and self.videoBits <= 8):
+                # Debayer 8-bit video as 8-bit (VNG only works on uint8)
+                image = (image >> 8).astype(np.uint8)
+        image = Video.colorMode(image, colorMode)
+        # Linearize and scale to 0-1, only color images and grayscale image files keep their color description
+        if(colorMode != Video.COLOR_RGB and
+           not (colorMode == Video.COLOR_GRAYSCALE and (isinstance(frame, str) or isinstance(file, list)))):
+            colorSpace = None
+        if(colorSpace is not None):
+            image = colorSpace.linearizeInteger(image, bgr=True)
+        else:
+            image = image.astype(np.float32)/np.iinfo(image.dtype).max
+        image = Lens.correct(image, lens)
+        self.colorSpace = colorSpace
+        return image
+        
+    # Returns a display encoded (0-255) copy of the frame (0-1, BGR) for alignment, 8-bit for video like the decoded frames
+    # Frames without a color description are used as decoded
+    @staticmethod
+    def alignImage(image, file, colorSpace):
+        if(colorSpace is None):
+            image = np.clip(image, 0, 1)*255
+        else:
+            image = cv2.cvtColor(ColorSpace.displayEncode(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), colorSpace)*255, cv2.COLOR_RGB2BGR)
+        if(not isinstance(file, list)):
+            # Video
+            image = np.around(image).astype(np.uint8)
         return image
       
     def guessColorMode(self, file, image=None):
@@ -191,9 +281,7 @@ class Video:
                     image = Video.readImage(file, cv2.IMREAD_UNCHANGED)
                 except Exception:
                     # Now try as video
-                    vidcap = cv2.VideoCapture(file)
-                    success,image = vidcap.read()
-                    vidcap.release()
+                    image = Video().readVideoFrame(file, 0, "rgb24")[0]
         if(image is not None):
             colorMode = self.guessImageColor(image)
         return colorMode
@@ -305,6 +393,7 @@ def loadFramesSequence(files, thread, width, height, colorMode, progress):
     frames = []
     sharps = []
     deltas = []
+    colorSpaces = []
     
     prevImage = None
     if(thread > 0 and len(files) > 0):
@@ -314,11 +403,12 @@ def loadFramesSequence(files, thread, width, height, colorMode, progress):
     
     for i, file in enumerate(files):
         progress.count(i, len(files))
-        image = Video.readImage(file, dtype=np.uint8)
+        image, colorSpace = Video.decodeImage(file, dtype=np.uint8)
         h, w = image.shape[:2]
         if(h == height and w == width):
             # Only add if dimensions match
             frames.append(file)
+            colorSpaces.append(colorSpace)
             image = Video.colorMode(image, colorMode)
 
             # Calculate sharpness
@@ -332,41 +422,41 @@ def loadFramesSequence(files, thread, width, height, colorMode, progress):
             
             prevImage = image
     progress.countExtra()
-    return (frames, sharps, deltas)
+    return (frames, sharps, deltas, colorSpaces)
         
-# Multiprocess function to load frames from a video source
-def loadFramesVideo(file, start, count, colorMode, progress):
-    beforeStart = max(0, start-1)
-    vidcap = cv2.VideoCapture(file)
-    vidcap.set(cv2.CAP_PROP_POS_FRAMES, beforeStart)
+# Multiprocess function to load frames from a video source (times in ms)
+def loadFramesVideo(file, times, previous, colorMode, progress):
+    video = Video()
     frames = []
     sharps = []
     deltas = []
     
     prevImage = None
-    if(beforeStart < start):
-        success,prevImage = vidcap.read()
+    if(previous is not None):
+        prevImage = video.readVideoFrame(file, previous, "rgb24")[0]
         prevImage = cv2.cvtColor(Video.colorMode(prevImage, colorMode), cv2.COLOR_BGR2GRAY)
         prevImage, wScaleFactor, hScaleFactor = resize(prevImage)
         
-    for i in range(0, count):
-        success,image = vidcap.read()
-        if(success):
-            progress.count(i, count)
-            frames.append(vidcap.get(cv2.CAP_PROP_POS_MSEC))
-            
-            # Calculate sharpness
-            sharps.append(calculateSharpness(image))
+    for i, time in enumerate(times):
+        progress.count(i, len(times))
+        try:
+            image = video.readVideoFrame(file, time, "rgb24")[0]
+        except EOFError:
+            break
+        if(video.lastTime != time):
+            # Frame couldn't be decoded
+            continue
+        frames.append(time)
+        
+        # Calculate sharpness
+        sharps.append(calculateSharpness(image))
 
-            # Calculate Frame Deltas
-            image = cv2.cvtColor(Video.colorMode(image, colorMode), cv2.COLOR_BGR2GRAY)
-            image, wScaleFactor, hScaleFactor = resize(image)
-            M = calculateDelta(image, prevImage, wScaleFactor, hScaleFactor)
-            deltas.append(M)
-            
-            prevImage = image
-        else:
-            progress.count(i, count)
+        # Calculate Frame Deltas
+        image = cv2.cvtColor(Video.colorMode(image, colorMode), cv2.COLOR_BGR2GRAY)
+        image, wScaleFactor, hScaleFactor = resize(image)
+        M = calculateDelta(image, prevImage, wScaleFactor, hScaleFactor)
+        deltas.append(M)
+        
+        prevImage = image
     progress.countExtra()
-    vidcap.release()
-    return (frames, sharps, deltas, wScaleFactor, hScaleFactor)
+    return (frames, sharps, deltas)

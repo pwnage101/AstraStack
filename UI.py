@@ -1,3 +1,4 @@
+from __future__ import annotations
 from lazy import lazy
 cv2 = lazy("cv2")
 np = lazy("numpy")
@@ -7,6 +8,7 @@ psutil = lazy("psutil")
 urllib = lazy("urllib")
 json = lazy("json")
 import subprocess, os, sys
+import gc
 import math
 import math
 import time
@@ -19,7 +21,10 @@ from Preferences import Preferences
 from Video import Video
 from Align import Align, centerOfMass, dilateImg, normalizeImg
 from Stack import Stack, transform
-from Process import Process
+from Process import Process, blackLevelFromSlider, sliderFromBlackLevel
+import Export
+import ColorSpace
+import Lens
 from Globals import *
 from deconvolution import *
 
@@ -33,13 +38,14 @@ class UI:
     ALIGN_TAB = 1
     STACK_TAB = 2
     PROCESS_TAB = 3
+    EXPORT_TAB = 4
     
     TITLE = "AstraStack"
     VERSION = "2.5.1"
     SNAP_DIR = ""
     HOME_DIR = "~"
     
-    def __init__(self):
+    def __init__(self) -> None:
         self.preferences = Preferences()
         self.pids = []
         self.newVersionUrl = ""
@@ -84,7 +90,11 @@ class UI:
         self.autoCrop = self.builder.get_object("autoCrop")
         self.driftType = self.builder.get_object("driftType")
         self.transformation = self.builder.get_object("transformation")
-        self.bitDepth = self.builder.get_object("bitDepth")
+        self.fileType = self.builder.get_object("fileType")
+        self.pixelFormats = {Export.FORMAT_8BIT: self.builder.get_object("pixelFormat8"),
+                             Export.FORMAT_16BIT: self.builder.get_object("pixelFormat16"),
+                             Export.FORMAT_16FLOAT: self.builder.get_object("pixelFormat16Float"),
+                             Export.FORMAT_32FLOAT: self.builder.get_object("pixelFormat32Float")}
         self.drizzleFactor = self.builder.get_object("drizzleFactor")
         self.drizzleInterpolation = self.builder.get_object("drizzleInterpolation")
         self.frameSort = self.builder.get_object("frameSort")
@@ -93,7 +103,35 @@ class UI:
         self.averageRadio = self.builder.get_object("averageRadio")
         self.medianRadio = self.builder.get_object("medianRadio")
         self.showMask = self.builder.get_object("showMask")
+        self.blackLevel = self.builder.get_object("blackLevelAdjust")
+        self.exposure = self.builder.get_object("exposureAdjust")
+        self.autoBlackLevel = self.builder.get_object("autoBlackLevel")
+        self.autoExposure = self.builder.get_object("autoExposure")
+        self.nonLinearNotice = self.builder.get_object("nonLinearNotice")
+        self.updatingLevels = False
+        self.lensCamera = self.builder.get_object("lensCamera")
+        self.lensLens = self.builder.get_object("lensLens")
+        self.lensFocal = self.builder.get_object("lensFocalAdjust")
+        self.lensAperture = self.builder.get_object("lensApertureAdjust")
+        self.lensDistortion = self.builder.get_object("lensDistortion")
+        self.lensTCA = self.builder.get_object("lensTCA")
+        self.lensVignetting = self.builder.get_object("lensVignetting")
+        self.lensStatus = self.builder.get_object("lensStatus")
         self.reference = None
+        
+        # Lensfun cameras and lenses by their index in the dropdowns
+        self.lensCameras = []
+        self.lensLenses = []
+        self.lensListCamera = None
+        self.lensMetadata = {}
+        self.lensUpdating = True
+        self.imageSize = None
+        self.lensCamera.get_model().append(None, ["None", -1])
+        self.lensLens.get_model().append(None, ["None", -1])
+        self.lensCamera.set_active(0)
+        self.lensLens.set_active(0)
+        self.lensUpdating = False
+        g.lens = Lens.LensCorrection()
         
         self.openDialog.set_preview_widget(Gtk.Image())
         self.saveDialog.set_preview_widget(Gtk.Image())
@@ -101,6 +139,7 @@ class UI:
         self.builder.get_object("alignTab").set_sensitive(False)
         self.builder.get_object("stackTab").set_sensitive(False)
         self.builder.get_object("processTab").set_sensitive(False)
+        self.builder.get_object("exportTab").set_sensitive(False)
         
         self.builder.get_object("deconvolveCircularDiameterWidget").add_mark(1, Gtk.PositionType.TOP, None)
         self.builder.get_object("deconvolveCircularAmountWidget").add_mark(25, Gtk.PositionType.TOP, None)
@@ -117,7 +156,7 @@ class UI:
         self.builder.get_object("deringBlend").add_mark(1, Gtk.PositionType.TOP, None)
         self.builder.get_object("blackLevel").add_mark(0, Gtk.PositionType.TOP, None)
         self.builder.get_object("gamma").add_mark(100, Gtk.PositionType.TOP, None)
-        self.builder.get_object("value").add_mark(100, Gtk.PositionType.TOP, None)
+        self.builder.get_object("exposure").add_mark(0, Gtk.PositionType.TOP, None)
         self.builder.get_object("red").add_mark(100, Gtk.PositionType.TOP, None)
         self.builder.get_object("green").add_mark(100, Gtk.PositionType.TOP, None)
         self.builder.get_object("blue").add_mark(100, Gtk.PositionType.TOP, None)
@@ -149,6 +188,8 @@ class UI:
         g.areaOfInterestP2 = (0, 0)
         
         g.guessedColorMode = Video.COLOR_RGB
+        g.colorSpace = ColorSpace.SRGB
+        g.colorSpaceFromImage = True
         
         g.limit = 0
         
@@ -158,6 +199,8 @@ class UI:
         g.level   = [None]*5
         
         g.stretchFunction = Process.STRETCH_NONE
+        g.gamma = 100
+        self.readLevels()
 
         self.window.show_all()
         self.loadOpenCV()
@@ -174,6 +217,8 @@ class UI:
         self.setDrizzleInterpolation()
         self.setFrameSortMethod()
         self.setAutoCrop()
+        self.setFileType()
+        self.setAutoLevels()
         self.frameScale.set_sensitive(False)
         
         g.file = None
@@ -298,12 +343,18 @@ class UI:
             self.preferences.set("cpus", g.nThreads)
             if(g.pool is not None):
                 g.pool.shutdown()
+            # Unreachable PyAV objects (e.g. from the file chooser preview) are freed here, not by the garbage collector of a
+            # forked process, where freeing a codec waits for threads that don't exist there.  Objects that exist when the
+            # processes are forked are frozen so the processes never collect them
+            gc.collect()
+            gc.freeze()
             g.pool = ProcessPoolExecutor(g.nThreads)
             
             # This seems like the most reliable way to get the pid of pool processes
             self.pids = []
             before = list(map(lambda p : p.pid, active_children()))
             g.pool.submit(dummy, ()).result()
+            gc.unfreeze()
             after = list(map(lambda p : p.pid, active_children()))
             for pid in after:
                 if(pid not in before):
@@ -366,8 +417,10 @@ class UI:
             return (response == Gtk.ResponseType.YES)
         return True
     
-    # Returns a new GdkPixbuf from the given image
-    def createPixbuf(self, img):
+    # Returns a new GdkPixbuf from the given RGB image (linear float images are display encoded from colorSpace, 8-bit images are used as is)
+    def createPixbuf(self, img, colorSpace=None):
+        if(img.dtype != np.uint8):
+            img = ColorSpace.displayImage(img, colorSpace)
         z = img.tobytes()
         Z = GLib.Bytes.new(z)
         height, width = img.shape[:2]
@@ -381,14 +434,14 @@ class UI:
             try:
                 # First try as image
                 video = Video()
-                img = cv2.cvtColor(video.getFrame(path, path, g.colorMode, dtype=np.uint8, thumbnail=True), cv2.COLOR_BGR2RGB).astype('uint8')
-                pixbuf = self.createPixbuf(img)
+                img = cv2.cvtColor(video.getFrame(path, path, g.colorMode, dtype=np.uint8, thumbnail=True), cv2.COLOR_BGR2RGB)
+                pixbuf = self.createPixbuf(img, video.colorSpace)
             except Exception:
                 try:
                     # Now try as video
                     video = Video()
-                    img = cv2.cvtColor(video.getFrame(path, 0, g.colorMode, dtype=np.uint8, thumbnail=True), cv2.COLOR_BGR2RGB).astype('uint8')
-                    pixbuf = self.createPixbuf(img)
+                    img = cv2.cvtColor(video.getFrame(path, 0, g.colorMode, dtype=np.uint8, thumbnail=True), cv2.COLOR_BGR2RGB)
+                    pixbuf = self.createPixbuf(img, video.colorSpace)
                 except Exception:
                     pass
         if(pixbuf is not None):
@@ -451,7 +504,7 @@ class UI:
             self.enableUI()
             
     # Opens the file chooser to open load a file
-    def openImage(self, *args):
+    def openImage(self, *args: object) -> None:
         self.openDialog.set_current_folder(os.path.expanduser(UI.HOME_DIR))
         self.openDialog.set_select_multiple(False)
         self.openDialog.set_filter(self.builder.get_object("imageFilter"))
@@ -463,10 +516,13 @@ class UI:
             try:
                 self.video = Video()
                 g.guessedColorMode = self.video.guessColorMode(g.file)
-                img = Video.readImage(g.file)
+                img, g.colorSpace = Video.decodeImage(g.file)
+                g.colorSpaceFromImage = True
                 h, w = img.shape[:2]
                 if(not self.checkMemory(w, h)):
                     raise MemoryError()
+                self.imageSize = (w, h)
+                self.prefillLens()
                 
                 self.window.set_title(os.path.split(g.file)[1] + " - " + UI.TITLE)
                 self.saveDialog.set_current_name("")
@@ -475,13 +531,15 @@ class UI:
                 
                 self.stack = None
                 self.process = Process(g.file, True)
+                self.showLevels()
                 self.builder.get_object("alignTab").set_sensitive(False)
                 self.builder.get_object("stackTab").set_sensitive(False)
                 self.builder.get_object("processTab").set_sensitive(True)
+                self.builder.get_object("exportTab").set_sensitive(True)
                 self.tabs.set_current_page(UI.PROCESS_TAB)
                 
-                img = cv2.cvtColor(self.video.getFrame(g.file, g.file, g.colorMode), cv2.COLOR_BGR2RGB).astype('uint8')
-                pixbuf = self.createPixbuf(img)
+                img = cv2.cvtColor(self.video.getFrame(g.file, g.file, g.colorMode, lens=g.lens), cv2.COLOR_BGR2RGB)
+                pixbuf = self.createPixbuf(img, g.actualColorSpace())
                 self.frame.set_from_pixbuf(pixbuf.copy())
             except MemoryError as error:
                 pass
@@ -490,37 +548,68 @@ class UI:
                 self.showErrorDialog("There was an error opening the image, make sure it is a valid image.")
             self.enableUI()
             
+    # Returns the file name with its extension replaced if it doesn't match the file type
+    def fixExtension(self, fileName, fileType):
+        root, ext = os.path.splitext(fileName)
+        if(ext.lower() in Export.EXTENSIONS[fileType]):
+            return fileName
+        return root + Export.EXTENSIONS[fileType][0]
+    
     # Opens the file chooser to save the final image
-    def saveFileDialog(self, *args):
+    def saveFileDialog(self, *args: object) -> None:
         from pathlib import Path
+        fileType = self.fileType.get_active_text()
+        pixelFormat = self.getPixelFormat()
         self.saveDialog.set_current_folder(os.path.expanduser(UI.HOME_DIR))
         if(self.saveDialog.get_current_name() == ""):
             # Set default file to save if empty
             if(isinstance(g.file, list)):
                 sList = g.file
-                self.saveDialog.set_current_name(Path(sList[0]).stem + "_" + Path(sList[-1]).stem + ".png")
+                self.saveDialog.set_current_name(Path(sList[0]).stem + "_" + Path(sList[-1]).stem)
             else:
-                self.saveDialog.set_current_name(Path(g.file).stem + ".png")
-        def start():
-            response = self.saveDialog.run()
-            if(response == Gtk.ResponseType.OK):
-                fileName = self.saveDialog.get_filename()
-                try:
-                    while(self.processThread != None and self.processThread.is_alive()):
-                        time.sleep(0.1) # Make sure the file isn't still being processed
-                    bitDepth = self.bitDepth.get_active_text()
-                    if(bitDepth == "8-bit"):
-                        cv2.imwrite(fileName, cv2.cvtColor(np.around(self.process.finalImage).astype('uint8'), cv2.COLOR_RGB2BGR))
-                    elif(bitDepth == "16-bit"):
-                        if(fileName.endswith(".png") or fileName.endswith(".tif") or fileName.endswith(".tiff")):
-                            cv2.imwrite(fileName, cv2.cvtColor(np.around(self.process.finalImage*255).astype('uint16'), cv2.COLOR_RGB2BGR))
-                        else:
-                            self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
-                            start()
-                except: # Save Failed
-                    self.showErrorDialog("There was an error saving the image, make sure it is a valid file extension.")
-        start()
+                self.saveDialog.set_current_name(Path(g.file).stem)
+        self.saveDialog.set_current_name(self.fixExtension(self.saveDialog.get_current_name(), fileType))
+        response = self.saveDialog.run()
+        if(response == Gtk.ResponseType.OK):
+            fileName = self.fixExtension(self.saveDialog.get_filename(), fileType)
+            if(fileName != self.saveDialog.get_filename() and os.path.exists(fileName)):
+                # The dialog only confirmed overwriting the typed file name
+                response = self.showWarningDialog(os.path.basename(fileName) + " already exists, do you want to replace it?")
+                if(response != Gtk.ResponseType.YES):
+                    self.saveDialog.hide()
+                    return
+            try:
+                while(self.processThread != None and self.processThread.is_alive()):
+                    time.sleep(0.1) # Make sure the file isn't still being processed
+                Export.write(fileName=fileName,
+                             img=self.process.finalImage,
+                             fileType=fileType,
+                             pixelFormat=pixelFormat,
+                             colorSpace=self.process.colorSpace,
+                             record=self.process.processingRecord)
+            except Exception as error: # Save Failed
+                print(error)
+                self.showErrorDialog("There was an error saving the image.")
         self.saveDialog.hide()
+        
+    # Returns the selected pixel format
+    def getPixelFormat(self):
+        for pixelFormat, radio in self.pixelFormats.items():
+            if(radio.get_active()):
+                return pixelFormat
+        
+    # Sets which pixel formats can be chosen for the file type
+    def setFileType(self, *args: object) -> None:
+        valid = Export.PIXEL_FORMATS[self.fileType.get_active_text()]
+        if(self.getPixelFormat() not in valid):
+            self.pixelFormats[valid[0]].set_active(True)
+        for pixelFormat, radio in self.pixelFormats.items():
+            radio.set_sensitive(pixelFormat in valid)
+        self.updateExportNotice()
+            
+    # Switches to the Export tab
+    def showExportTab(self, *args):
+        self.tabs.set_current_page(UI.EXPORT_TAB)
         
     # Called when the video is finished loading
     def finishedVideo(self):
@@ -545,6 +634,8 @@ class UI:
             self.frameSlider.set_value(self.video.sharpest)
 
             self.updateAutoColorModeText()
+            self.imageSize = (self.video.width, self.video.height)
+            self.prefillLens()
             self.setReference()
             self.setStartFrame()
             self.setEndFrame()
@@ -554,6 +645,8 @@ class UI:
                 sList = g.file
                 if(len(sList) != len(self.video.frames)):
                     self.showErrorDialog("Not all images were added to the stack.  Make sure they are all the same dimensions.")
+                if(self.video.colorSpaceMismatch):
+                    self.showErrorDialog("Not all images have the same color space.  The color space of the first image is used for all of them.")
                 self.window.set_title(os.path.split(sList[0])[1] + " ... " + os.path.split(sList[-1])[1] +  " - " + UI.TITLE)
             else:
                 self.window.set_title(os.path.split(g.file)[1] + " - " + UI.TITLE)
@@ -562,6 +655,7 @@ class UI:
             self.builder.get_object("alignTab").set_sensitive(True)
             self.builder.get_object("stackTab").set_sensitive(False)
             self.builder.get_object("processTab").set_sensitive(False)
+            self.builder.get_object("exportTab").set_sensitive(False)
             self.stack = None
         GLib.idle_add(update)
         
@@ -615,7 +709,6 @@ class UI:
         
     # Called when the tab is changed.  Updates parts of the UI based on the tab
     def changeTab(self, notebook, page, page_num, user_data=None):
-        self.colorMode.set_sensitive(True)
         if((page_num == UI.LOAD_TAB or page_num == UI.ALIGN_TAB) and self.video is not None):
             self.setStartFrame()
             self.setEndFrame()
@@ -629,10 +722,19 @@ class UI:
             if(len(self.video.frames) > 0):
                 self.frameScale.show()
             self.updateImage(None, page_num)
-        elif(page_num == UI.PROCESS_TAB and self.process is not None):
+        elif(page_num == UI.PROCESS_TAB and (self.process is not None or
+                                             (self.video is not None and len(self.video.frames) == 0))):
+            # A single image's Process is rebuilt by processImage after a color mode change
             self.frameScale.hide()
-            self.colorMode.set_sensitive(False)
             self.processImage()
+        elif(page_num == UI.EXPORT_TAB and (self.process is not None or
+                                            (self.video is not None and len(self.video.frames) == 0))):
+            # Shows the Process result
+            self.frameScale.hide()
+            if(self.process is None):
+                self.processImage()
+            elif(self.processThread is None or not self.processThread.is_alive()):
+                self.finishedProcessing()
         self.fixFrameSliderBug()
     
     # Changes the image frame to the frameSlider position    
@@ -645,10 +747,10 @@ class UI:
             videoIndex = int(self.frameSlider.get_value())
             if(len(self.video.frames) == 0):
                 # Single Image
-                img = cv2.cvtColor(self.video.getFrame(g.file, g.file, g.actualColor()), cv2.COLOR_BGR2RGB).astype(np.uint8)
+                img = ColorSpace.displayImage(cv2.cvtColor(self.video.getFrame(g.file, g.file, g.actualColor(), lens=g.lens), cv2.COLOR_BGR2RGB), g.actualColorSpace())
             else:
                 # Video/Sequence
-                img = cv2.cvtColor(self.video.getFrame(g.file, self.video.frames[videoIndex], g.actualColor()), cv2.COLOR_BGR2RGB).astype(np.uint8)
+                img = ColorSpace.displayImage(cv2.cvtColor(self.video.getFrame(g.file, self.video.frames[videoIndex], g.actualColor(), lens=g.lens), cv2.COLOR_BGR2RGB), g.actualColorSpace())
                 
             height, width = img.shape[:2]
             
@@ -687,15 +789,15 @@ class UI:
             tmat = self.stack.tmats[int(self.frameSlider.get_value())]
             videoIndex = tmat[0]
             M = tmat[1]
-            img = self.video.getFrame(g.file, videoIndex, g.actualColor()).astype(np.uint8)
+            img = self.video.getFrame(g.file, videoIndex, g.actualColor(), lens=g.lens)
             if(g.autoCrop):
-                ref = self.stack.refBG.astype(np.uint8)
+                ref = self.stack.refBG
             else:
                 ref = None
             img = transform(img, ref, M, self.align.minX, self.align.maxX, self.align.minY, self.align.maxY, g)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            pixbuf = self.createPixbuf(img)
+            pixbuf = self.createPixbuf(img, g.actualColorSpace())
             self.frame.set_from_pixbuf(pixbuf.copy())
             self.updateQualityImage()
             
@@ -885,7 +987,7 @@ class UI:
         self.psfImage.set_from_pixbuf(pixbuf.copy())
     
     # Updates the RGB histogram of the final image    
-    def updateHistogram(self):
+    def updateHistogram(self) -> None:
         allocation = self.builder.get_object("processTab").get_allocation()
         width = max(250, allocation.width-1)
         padding = 5
@@ -893,8 +995,9 @@ class UI:
         bins = np.arange(256).reshape(256, 1)
         
         color = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+        display = ColorSpace.displayImage(self.process.finalImage, self.process.colorSpace)
         for i, col in enumerate(color):
-            hist = np.log(cv2.calcHist([np.around(self.process.finalImage).astype('uint8')],[i],None,[256],[0,256]) + 1)
+            hist = np.log(cv2.calcHist([display],[i],None,[256],[0,256]) + 1)
             cv2.normalize(hist, hist, 0, 99, cv2.NORM_MINMAX)
             hist = 99 - hist
             hist = np.int32(np.around(hist))
@@ -909,7 +1012,7 @@ class UI:
     # Sets the reference frame to the current visible frame
     def setReference(self, *args):
         g.reference = str(int(self.frameSlider.get_value()))
-        self.reference = self.video.getFrame(g.file, self.video.frames[int(g.reference)], g.actualColor())
+        self.reference = self.video.getFrame(g.file, self.video.frames[int(g.reference)], g.actualColor(), lens=g.lens)
         self.builder.get_object("referenceLabel").set_text(g.reference)
         self.builder.get_object("alignButton").set_sensitive(True)
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
@@ -936,7 +1039,7 @@ class UI:
             # Reference is outside of the range, fix it
             g.reference = str(int(g.startFrame))
             self.builder.get_object("referenceLabel").set_text(g.reference)
-            self.reference = self.video.getFrame(g.file, self.video.frames[int(g.reference)], g.actualColor())
+            self.reference = self.video.getFrame(g.file, self.video.frames[int(g.reference)], g.actualColor(), lens=g.lens)
         self.fixFrameSliderBug()
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
             self.updateImage()
@@ -951,7 +1054,7 @@ class UI:
             # Reference is outside of the range, fix it
             g.reference = str(int(g.endFrame))
             self.builder.get_object("referenceLabel").set_text(g.reference)
-            self.reference = self.video.getFrame(g.file, self.video.frames[int(g.reference)], g.actualColor())
+            self.reference = self.video.getFrame(g.file, self.video.frames[int(g.reference)], g.actualColor(), lens=g.lens)
         self.fixFrameSliderBug()
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
             self.updateImage()
@@ -1064,20 +1167,169 @@ class UI:
     # Sets whether or not to align channels separately
     def setAlignChannels(self, *args):
         g.alignChannels = self.alignChannels.get_active()
+        # TCA correction and Align RGB are mutually exclusive
+        self.updateLensSettings()
     
     # Sets the color mode of the input
     def setColorMode(self, *args):
         if(self.colorMode.is_sensitive()):
+            oldColor = g.actualColor() if self.video is not None else None
             g.colorMode = self.colorMode.get_active()
-            if(g.colorMode == Video.COLOR_RGGB or
-               g.colorMode == Video.COLOR_GRBG or
-               g.colorMode == Video.COLOR_GRBG or
-               g.colorMode == Video.COLOR_BGGR or
-               g.colorMode == Video.COLOR_RGGB_VNG or
-               g.colorMode == Video.COLOR_GRBG_VNG or
-               g.colorMode == Video.COLOR_GRBG_VNG or
-               g.colorMode == Video.COLOR_BGGR_VNG):
+            if(g.colorMode >= Video.COLOR_RGGB):
                 self.preferences.set("bayerGuess", g.colorMode)
+            if(oldColor is not None and g.actualColor() != oldColor):
+                # Previous results were decoded with the old color mode, so discard them
+                self.discardResults()
+            self.updateImage()
+            
+    # Discards the results decoded with old settings (color mode, lens correction)
+    def discardResults(self):
+        self.process = None
+        if(len(self.video.frames) > 0):
+            # Video/Sequence
+            self.stack = None
+            self.reference = self.video.getFrame(g.file, self.video.frames[int(g.reference)], g.actualColor(), lens=g.lens)
+            self.builder.get_object("alignTab").set_sensitive(True)
+            self.builder.get_object("stackTab").set_sensitive(False)
+            self.builder.get_object("processTab").set_sensitive(False)
+            self.builder.get_object("exportTab").set_sensitive(False)
+            
+    # Fills the camera dropdown from the lensfun database, grouped by maker
+    def populateLensCameras(self):
+        if(len(self.lensCameras) > 0):
+            return
+        # Filled while detached, appending to a combo's model is very slow
+        store = self.lensCamera.get_model()
+        self.lensCamera.set_model(None)
+        makers = {}
+        for camera in sorted(Lens.database().cameras, key=lambda c: (c.maker.lower(), Lens.displayName(c).lower())):
+            if(camera.maker not in makers):
+                makers[camera.maker] = store.append(None, [camera.maker, -1])
+            store.append(makers[camera.maker], [Lens.displayName(camera), len(self.lensCameras)])
+            self.lensCameras.append(camera)
+        self.lensCamera.set_model(store)
+        self.lensCamera.set_active(0)
+            
+    # Fills the lens dropdown with the lenses that fit the camera (every lens without a camera), plus the extra lens
+    def populateLensLenses(self, camera, extra=None):
+        # A new store is filled while detached, clearing or appending to a combo's model is very slow
+        store = Gtk.TreeStore(str, int)
+        self.lensLens.set_model(None)
+        store.append(None, ["None", -1])
+        lenses = list(Lens.database().find_lenses(camera)) if camera is not None else list(Lens.database().lenses)
+        if(extra is not None and not any(Lens.sameItem(lens, extra) for lens in lenses)):
+            lenses.append(extra)
+        self.lensLenses = []
+        makers = {}
+        for lens in sorted(lenses, key=lambda l: (l.maker.lower(), l.model.lower())):
+            if(lens.maker not in makers):
+                makers[lens.maker] = store.append(None, [lens.maker, -1])
+            store.append(makers[lens.maker], [lens.model, len(self.lensLenses)])
+            self.lensLenses.append(lens)
+        self.lensLens.set_model(store)
+        self.lensLens.set_active(0)
+        self.lensListCamera = camera
+        
+    # Selects the item (None selects "None") in the camera or lens dropdown
+    def selectLensItem(self, combo, items, item):
+        index = -1
+        for i, other in enumerate(items):
+            if(item is not None and Lens.sameItem(other, item)):
+                index = i
+                break
+        def find(iter):
+            while(iter is not None):
+                if(combo.get_model()[iter][1] == index):
+                    return iter
+                child = find(combo.get_model().iter_children(iter))
+                if(child is not None):
+                    return child
+                iter = combo.get_model().iter_next(iter)
+            return None
+        combo.set_active_iter(find(combo.get_model().get_iter_first()))
+        
+    # Returns the selected item of the camera or lens dropdown, None when there is none
+    def selectedLensItem(self, combo, items):
+        iter = combo.get_active_iter()
+        if(iter is None or combo.get_model()[iter][1] < 0):
+            return None
+        return items[combo.get_model()[iter][1]]
+        
+    # Fills in the lens correction from the file's metadata (EXIF or Nikon NCTG), corrections are on when the lens is found
+    def prefillLens(self):
+        self.lensUpdating = True
+        self.populateLensCameras()
+        self.lensMetadata = Lens.readMetadata(g.file)
+        g.lens.cropRegion = self.lensMetadata.get("cropRegion")
+        camera = Lens.findCamera(self.lensMetadata.get("make"), self.lensMetadata.get("model"))
+        lens = Lens.findLens(camera, self.lensMetadata.get("lensMake"), self.lensMetadata.get("lens"))
+        self.selectLensItem(self.lensCamera, self.lensCameras, camera)
+        self.populateLensLenses(camera, lens)
+        self.selectLensItem(self.lensLens, self.lensLenses, lens)
+        self.lensFocal.set_value(self.lensMetadata.get("focal", 0))
+        self.lensAperture.set_value(self.lensMetadata.get("aperture", 0))
+        found = (lens is not None)
+        self.lensDistortion.set_active(found)
+        self.lensTCA.set_active(found and not self.alignChannels.get_active())
+        self.lensVignetting.set_active(found)
+        self.lensUpdating = False
+        self.updateLensSettings()
+        
+    # Reads the lens correction widgets into g.lens, updates which corrections can be used and the status
+    def updateLensSettings(self):
+        self.lensUpdating = True
+        camera = self.selectedLensItem(self.lensCamera, self.lensCameras)
+        if(not Lens.sameItem(camera, self.lensListCamera)):
+            # The lenses depend on the camera, keep the selected lens
+            lens = self.selectedLensItem(self.lensLens, self.lensLenses)
+            self.populateLensLenses(camera, lens)
+            self.selectLensItem(self.lensLens, self.lensLenses, lens)
+        lens = self.selectedLensItem(self.lensLens, self.lensLenses)
+        g.lens.cameraMaker = camera.maker if camera is not None else None
+        g.lens.cameraModel = camera.model if camera is not None else None
+        g.lens.lensMaker = lens.maker if lens is not None else None
+        g.lens.lensModel = lens.model if lens is not None else None
+        g.lens.focal = self.lensFocal.get_value()
+        g.lens.aperture = self.lensAperture.get_value()
+        
+        status = []
+        geometry = True
+        if(lens is None):
+            if(self.lensMetadata.get("lens") is not None):
+                status.append("Lens \"" + self.lensMetadata["lens"] + "\" not found")
+            else:
+                status.append("No lens selected")
+        else:
+            if(camera is None):
+                if(self.lensMetadata.get("model") is not None):
+                    status.append("Camera \"" + self.lensMetadata["model"] + "\" not found")
+                status.append("Assuming the crop factor of the lens calibration (" + str(round(lens.crop_factor, 2)) + ")")
+            if(self.imageSize is not None):
+                crop, geometry = Lens.imageCropFactor(lens, camera, g.lens.cropRegion, *self.imageSize)
+                status.append("Image crop factor " + str(round(crop, 2)))
+            if(not geometry):
+                status.append("The crop isn't centered on the sensor, so distortion and TCA can't be corrected")
+            if(g.lens.focal <= 0 or g.lens.aperture <= 0):
+                status.append("Enter the focal length and aperture")
+        self.lensStatus.set_text("\n".join(status))
+        
+        self.lensDistortion.set_sensitive(lens is not None and geometry and len(lens.calib_distortion) > 0)
+        self.lensTCA.set_sensitive(lens is not None and geometry and len(lens.calib_tca) > 0 and not self.alignChannels.get_active())
+        self.lensVignetting.set_sensitive(lens is not None and len(lens.calib_vignetting) > 0)
+        g.lens.distortion = self.lensDistortion.get_sensitive() and self.lensDistortion.get_active()
+        g.lens.tca = self.lensTCA.get_sensitive() and self.lensTCA.get_active()
+        g.lens.vignetting = self.lensVignetting.get_sensitive() and self.lensVignetting.get_active()
+        self.alignChannels.set_sensitive(not g.lens.tca)
+        self.lensUpdating = False
+            
+    # Sets the lens correction, results with a different correction are discarded
+    def setLensCorrection(self, *args):
+        if(self.lensUpdating):
+            return
+        oldKey = g.lens.key()
+        self.updateLensSettings()
+        if(self.video is not None and g.file is not None and g.lens.key() != oldKey):
+            self.discardResults()
             self.updateImage()
     
     def setDriftType(self, *args):
@@ -1187,6 +1439,7 @@ class UI:
             self.builder.get_object("alignTab").set_sensitive(True)
             self.builder.get_object("stackTab").set_sensitive(True)
             self.builder.get_object("processTab").set_sensitive(False)
+            self.builder.get_object("exportTab").set_sensitive(False)
             self.limit.set_upper(len(self.stack.tmats))
             self.limit.set_value(int(len(self.stack.tmats)/2))
             self.limitPercent.set_value(round(self.limit.get_value()/len(self.stack.tmats)*100))
@@ -1219,19 +1472,21 @@ class UI:
             self.enableUI()
         
     # Called when the stack is complete
-    def finishedStack(self):
-        def update():
+    def finishedStack(self) -> None:
+        def update() -> None:
             self.process = Process(self.stack.stackedImage)
+            self.showLevels()
             self.tabs.next_page()
             self.enableUI()
             self.builder.get_object("alignTab").set_sensitive(True)
             self.builder.get_object("stackTab").set_sensitive(True)
             self.builder.get_object("processTab").set_sensitive(True)
+            self.builder.get_object("exportTab").set_sensitive(True)
         GLib.idle_add(update)
         
     # Processes the final Stacked image
-    def processImage(self, *args):
-        if(g.file is None):
+    def processImage(self, *args: object) -> None:
+        if(g.file is None or self.updatingLevels):
             return
         self.processSpinner.start()
         self.processSpinner.show()
@@ -1267,8 +1522,7 @@ class UI:
         g.deringBlend = int(self.builder.get_object("deringBlendAdjust").get_value())
         
         g.gamma = self.builder.get_object("gammaAdjust").get_value()
-        g.blackLevel = self.builder.get_object("blackLevelAdjust").get_value()
-        g.value = self.builder.get_object("valueAdjust").get_value()
+        self.readLevels()
         
         g.redAdjust = self.builder.get_object("redAdjust").get_value()
         g.greenAdjust = self.builder.get_object("greenAdjust").get_value()
@@ -1276,17 +1530,40 @@ class UI:
         g.saturation = self.builder.get_object("saturationAdjust").get_value()
         
         g.stretchFunction = self.builder.get_object("stretchFunction").get_active()
+        self.updateExportNotice()
         
-        if(len(args) > 0 and (self.builder.get_object("stretchFunction") == args[0])):
-            self.process = None
+        created = False
+        if(self.process is None):
+            if(self.stack is not None):
+                self.process = Process(self.stack.stackedImage)
+            else:
+                self.process = Process(g.file, True)
+            self.showLevels()
+            created = True
         
-        if(len(args) > 0 and (self.builder.get_object("gammaAdjust") == args[0] or
-                              self.builder.get_object("blackLevelAdjust") == args[0] or
-                              self.builder.get_object("redAdjust") == args[0] or
-                              self.builder.get_object("greenAdjust") == args[0] or
-                              self.builder.get_object("blueAdjust") == args[0] or
-                              self.builder.get_object("saturationAdjust") == args[0] or
-                              self.builder.get_object("valueAdjust") == args[0])):
+        processLevels = self.process.processLevelsAgain
+        if(created):
+            # Everything after the levels (applied when it was built) still needs to be processed
+            processAgain = True
+            processDeblur = False
+            processDering = False
+            processColor = False
+        elif(len(args) > 0 and (self.blackLevel == args[0] or
+                              self.exposure == args[0] or
+                              self.autoBlackLevel == args[0] or
+                              self.autoExposure == args[0])):
+            # Black Level and Exposure precede the wavelets
+            processAgain = False
+            processDeblur = False
+            processDering = False
+            processColor = False
+            processLevels = True
+        elif(len(args) > 0 and (self.builder.get_object("gammaAdjust") == args[0] or
+                                self.builder.get_object("stretchFunction") == args[0] or
+                                self.builder.get_object("redAdjust") == args[0] or
+                                self.builder.get_object("greenAdjust") == args[0] or
+                                self.builder.get_object("blueAdjust") == args[0] or
+                                self.builder.get_object("saturationAdjust") == args[0])):
             processAgain = self.process.processAgain
             processDeblur = self.process.processDeblurAgain
             processDering = self.process.processDeringAgain
@@ -1327,29 +1604,94 @@ class UI:
             processDering = False
             processColor = False
         
-        if(self.process is None):
-            if(self.stack is not None):
-                self.process = Process(self.stack.stackedImage)
-            else:
-                self.process = Process(g.file, True)
         if(self.processThread != None and self.processThread.is_alive()):
+            self.process.processLevelsAgain = processLevels
             self.process.processAgain = processAgain
             self.process.processDeblurAgain = processDeblur
             self.process.processDeringAgain = processDering
             self.process.processColorAgain = processColor
         else:
-            self.processThread = Thread(target=self.process.run, args=(processAgain, processDeblur, processDering, processColor))
+            self.processThread = Thread(target=self.process.run,
+                                        kwargs={"processAgain": processAgain,
+                                                "processDeblurAgain": processDeblur,
+                                                "processDeringAgain": processDering,
+                                                "processColorAgain": processColor,
+                                                "processLevelsAgain": processLevels})
             self.processThread.start()
         self.updatePSFImage(args)
     
+    def readLevels(self) -> None:
+        """Reads the Black Level and Exposure controls into the globals."""
+        g.autoBlackLevel = self.autoBlackLevel.get_active()
+        g.autoExposure = self.autoExposure.get_active()
+        g.blackLevel = blackLevelFromSlider(self.blackLevel.get_value())
+        g.exposure = self.exposure.get_value()
+        
+    def showLevels(self) -> None:
+        """Shows the black level and exposure computed for the automatic toggles on their sliders."""
+        if(self.process is None):
+            return
+        (blackLevel, exposure) = self.process.levels()
+        self.updatingLevels = True
+        if(g.autoBlackLevel):
+            self.blackLevel.set_value(sliderFromBlackLevel(blackLevel))
+        if(g.autoExposure):
+            self.exposure.set_value(exposure)
+        self.updatingLevels = False
+        
+    def setAutoLevels(self, *args: object) -> None:
+        """Makes the sliders insensitive while their automatic toggle is on, and reprocesses when a toggle changed.
+
+        Args:
+            *args: Signal arguments, the toggled check button first; empty when called during setup.
+        """
+        self.builder.get_object("blackLevel").set_sensitive(not self.autoBlackLevel.get_active())
+        self.builder.get_object("exposure").set_sensitive(not self.autoExposure.get_active())
+        if(len(args) > 0):
+            self.processImage(*args)
+        
+    def formatBlackLevel(self, scale: Gtk.Scale, value: float) -> str:
+        """Formats the Black Level slider value as a percentage of full scale.
+
+        Args:
+            scale: The Black Level slider.
+            value: Slider value, log10 of the percentage of full scale.
+
+        Returns:
+            The percentage shown next to the slider.
+        """
+        blackLevel = blackLevelFromSlider(value)*100
+        if(blackLevel == 0):
+            return "0%"
+        elif(blackLevel < 1):
+            return "%.3f%%" % blackLevel
+        return "%.1f%%" % blackLevel
+        
+    def updateExportNotice(self, *args: object) -> None:
+        """Shows the notice that float exports aren't linear when Stretch or Gamma is applied.
+
+        Args:
+            *args: Signal arguments, unused.
+        """
+        stretch = self.builder.get_object("stretchFunction").get_active()
+        gamma = self.builder.get_object("gammaAdjust").get_value()
+        floatFormat = self.getPixelFormat() in (Export.FORMAT_16FLOAT, Export.FORMAT_32FLOAT)
+        self.nonLinearNotice.set_visible(floatFormat and (stretch != Process.STRETCH_NONE or max(1, gamma) != 100))
+        
     # Called when processing is complete
-    def finishedProcessing(self, *args):
-        def update():
+    def finishedProcessing(self, *args: object) -> None:
+        def update() -> None:
+            if(self.process is None):
+                # Discarded while processing (color mode or lens correction changed)
+                self.processSpinner.stop()
+                self.processSpinner.hide()
+                return
             if(self.showMask.get_active() and self.process.thresh is not None):
                 pixbuf = self.createPixbuf(np.around(self.process.thresh).astype('uint8'))
             else:
-                pixbuf = self.createPixbuf(np.around(self.process.finalImage).astype('uint8'))
+                pixbuf = self.createPixbuf(self.process.finalImage, self.process.colorSpace)
             self.frame.set_from_pixbuf(pixbuf.copy())
+            self.showLevels()
             self.updateHistogram()
             self.processSpinner.stop()
             self.processSpinner.hide()

@@ -10,3 +10,10 @@ PyGObject==3.54.5
 pystackreg==0.2.8
 PyWavelets==1.9.0
 rawpy==0.25.1
+tifffile==2026.3.3
+Pillow==13.0.0
+OpenEXR==3.5.2
+colour-science==0.4.6
+scipy==1.16.3
+av==19.0.2
+lensfunpy==1.18.0

@@ -74,10 +74,6 @@ class Stack:
             return
 
         self.stackedImage /= g.limit
-        
-        # Make sure there wasn't any overshoot from the transformations
-        self.stackedImage[self.stackedImage>255] = 255
-        self.stackedImage[self.stackedImage<0] = 0
         self.stackedImage = self.stackedImage.astype(np.float32)
         
         if(g.alignChannels):
@@ -122,7 +118,7 @@ def blendAverage(frames, ref, minX, maxX, minY, maxY, progress, gCopy):
     video = Video()
     stackedImage = None
     for c, (frame, M, diff, sharp) in enumerate(frames):
-        image = video.getFrame(gCopy.file, frame, gCopy.actualColor())
+        image = video.getFrame(gCopy.file, frame, gCopy.actualColor(), lens=gCopy.lens)
         image = transform(image, ref, M, 
                           minX, maxX, minY, maxY, gCopy).astype(np.float64)
         if stackedImage is None:

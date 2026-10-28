@@ -36,8 +36,11 @@
     </child>
   </object>
   <object class="GtkAdjustment" id="blackLevelAdjust">
-    <property name="upper">255</property>
-    <property name="step-increment">1</property>
+    <property name="lower">-2</property>
+    <property name="upper">2</property>
+    <property name="value">-2</property>
+    <property name="step-increment">0.05</property>
+    <property name="page-increment">0.5</property>
     <signal name="value-changed" handler="processImage" swapped="no"/>
   </object>
   <object class="GtkAdjustment" id="blueAdjust">
@@ -343,6 +346,34 @@
       <pattern>*.X3F</pattern>
     </patterns>
   </object>
+  <object class="GtkAdjustment" id="lensApertureAdjust">
+    <property name="upper">64</property>
+    <property name="step-increment">0.1</property>
+    <property name="page-increment">1</property>
+    <signal name="value-changed" handler="setLensCorrection" swapped="no"/>
+  </object>
+  <object class="GtkTreeStore" id="lensCameraStore">
+    <columns>
+      <!-- column-name name -->
+      <column type="gchararray"/>
+      <!-- column-name index -->
+      <column type="gint"/>
+    </columns>
+  </object>
+  <object class="GtkAdjustment" id="lensFocalAdjust">
+    <property name="upper">5000</property>
+    <property name="step-increment">1</property>
+    <property name="page-increment">10</property>
+    <signal name="value-changed" handler="setLensCorrection" swapped="no"/>
+  </object>
+  <object class="GtkTreeStore" id="lensLensStore">
+    <columns>
+      <!-- column-name name -->
+      <column type="gchararray"/>
+      <!-- column-name index -->
+      <column type="gint"/>
+    </columns>
+  </object>
   <object class="GtkAdjustment" id="limit">
     <property name="lower">1</property>
     <property name="upper">1</property>
@@ -518,11 +549,15 @@
       <pattern>*.jpg</pattern>
       <pattern>*.jpeg</pattern>
       <pattern>*.png</pattern>
+      <pattern>*.tif</pattern>
       <pattern>*.tiff</pattern>
+      <pattern>*.exr</pattern>
       <pattern>*.JPG</pattern>
       <pattern>*.JPEG</pattern>
       <pattern>*.PNG</pattern>
+      <pattern>*.TIF</pattern>
       <pattern>*.TIFF</pattern>
+      <pattern>*.EXR</pattern>
     </patterns>
   </object>
   <object class="GtkFileChooserDialog" id="saveDialog">
@@ -553,56 +588,6 @@
             <property name="expand">False</property>
             <property name="fill">False</property>
             <property name="position">0</property>
-          </packing>
-        </child>
-        <child>
-          <object class="GtkBox">
-            <property name="visible">True</property>
-            <property name="can-focus">False</property>
-            <property name="halign">end</property>
-            <property name="margin-left">5</property>
-            <property name="margin-right">5</property>
-            <property name="margin-top">5</property>
-            <property name="margin-bottom">5</property>
-            <property name="spacing">5</property>
-            <child>
-              <object class="GtkLabel">
-                <property name="visible">True</property>
-                <property name="can-focus">False</property>
-                <property name="tooltip-text" translatable="yes">How many bits per channel</property>
-                <property name="label" translatable="yes">Bit Depth:</property>
-                <attributes>
-                  <attribute name="weight" value="bold"/>
-                </attributes>
-              </object>
-              <packing>
-                <property name="expand">False</property>
-                <property name="fill">True</property>
-                <property name="position">0</property>
-              </packing>
-            </child>
-            <child>
-              <object class="GtkComboBoxText" id="bitDepth">
-                <property name="visible">True</property>
-                <property name="can-focus">False</property>
-                <property name="active">0</property>
-                <property name="active-id">0</property>
-                <items>
-                  <item id="0" translatable="yes">8-bit</item>
-                  <item id="1" translatable="yes">16-bit</item>
-                </items>
-              </object>
-              <packing>
-                <property name="expand">False</property>
-                <property name="fill">True</property>
-                <property name="position">1</property>
-              </packing>
-            </child>
-          </object>
-          <packing>
-            <property name="expand">False</property>
-            <property name="fill">True</property>
-            <property name="position">2</property>
           </packing>
         </child>
       </object>
@@ -638,10 +623,11 @@
     <property name="step-increment">1</property>
     <signal name="value-changed" handler="setStartFrame" swapped="no"/>
   </object>
-  <object class="GtkAdjustment" id="valueAdjust">
-    <property name="upper">400</property>
-    <property name="value">100</property>
-    <property name="step-increment">1</property>
+  <object class="GtkAdjustment" id="exposureAdjust">
+    <property name="lower">-5</property>
+    <property name="upper">10</property>
+    <property name="step-increment">0.1</property>
+    <property name="page-increment">1</property>
     <signal name="value-changed" handler="processImage" swapped="no"/>
   </object>
   <object class="GtkWindow" id="mainWindow">
@@ -673,7 +659,7 @@
                     <property name="margin-right">5</property>
                     <signal name="switch-page" handler="changeTab" swapped="no"/>
                     <child>
-                      <!-- n-columns=2 n-rows=9 -->
+                      <!-- n-columns=2 n-rows=22 -->
                       <object class="GtkGrid" id="loadTab">
                         <property name="visible">True</property>
                         <property name="can-focus">False</property>
@@ -800,11 +786,283 @@
                             <property name="visible">True</property>
                             <property name="can-focus">True</property>
                             <property name="receives-default">True</property>
+                            <property name="margin-bottom">10</property>
                             <signal name="clicked" handler="openImage" swapped="no"/>
                           </object>
                           <packing>
                             <property name="left-attach">0</property>
                             <property name="top-attach">8</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Color</property>
+                            <attributes>
+                              <attribute name="weight" value="bold"/>
+                            </attributes>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">9</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Choose how the colors of the input are read</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">10</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkComboBoxText" id="colorMode">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="tooltip-text" translatable="yes">Pick a Bayer pattern for color camera data that hasn't been debayered.</property>
+                            <property name="active">0</property>
+                            <items>
+                              <item id="0" translatable="yes">Auto</item>
+                              <item id="1" translatable="yes">RGB</item>
+                              <item id="2" translatable="yes">Grayscale</item>
+                              <item id="3" translatable="yes">Bayer RGGB</item>
+                              <item id="4" translatable="yes">Bayer GRBG</item>
+                              <item id="5" translatable="yes">Bayer GBRG</item>
+                              <item id="6" translatable="yes">Bayer BGGR</item>
+                              <item id="7" translatable="yes">Bayer RGGB (VNG)</item>
+                              <item id="8" translatable="yes">Bayer GRBG (VNG)</item>
+                              <item id="9" translatable="yes">Bayer GBRG (VNG)</item>
+                              <item id="10" translatable="yes">Bayer BGGR (VNG)</item>
+                            </items>
+                            <signal name="changed" handler="setColorMode" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">11</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Lens correction</property>
+                            <property name="margin-top">10</property>
+                            <attributes>
+                              <attribute name="weight" value="bold"/>
+                            </attributes>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">12</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Correct the camera lens using the lensfun database</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">13</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Camera</property>
+                            <property name="xalign">0</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">14</property>
+                            <property name="width">1</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkComboBox" id="lensCamera">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="tooltip-text" translatable="yes">Read from the file when it has the camera in its metadata.  Choose it by hand for other files.</property>
+                            <property name="model">lensCameraStore</property>
+                            <property name="active">0</property>
+                            <signal name="changed" handler="setLensCorrection" swapped="no"/>
+                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                            <child>
+                              <object class="GtkCellRendererText"/>
+                              <attributes>
+                                <attribute name="text">0</attribute>
+                              </attributes>
+                            </child>
+                          </object>
+                          <packing>
+                            <property name="left-attach">1</property>
+                            <property name="top-attach">14</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Lens</property>
+                            <property name="xalign">0</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">15</property>
+                            <property name="width">1</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkComboBox" id="lensLens">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="tooltip-text" translatable="yes">Read from the file when it has the lens in its metadata.  Choose it by hand for other files.</property>
+                            <property name="model">lensLensStore</property>
+                            <property name="active">0</property>
+                            <signal name="changed" handler="setLensCorrection" swapped="no"/>
+                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                            <child>
+                              <object class="GtkCellRendererText"/>
+                              <attributes>
+                                <attribute name="text">0</attribute>
+                              </attributes>
+                            </child>
+                          </object>
+                          <packing>
+                            <property name="left-attach">1</property>
+                            <property name="top-attach">15</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Focal Length (mm)</property>
+                            <property name="xalign">0</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">16</property>
+                            <property name="width">1</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="lensFocal">
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="tooltip-text" translatable="yes">The focal length the frames were taken at</property>
+                            <property name="adjustment">lensFocalAdjust</property>
+                            <property name="digits">1</property>
+                            <property name="numeric">True</property>
+                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">1</property>
+                            <property name="top-attach">16</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Aperture (f/)</property>
+                            <property name="xalign">0</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">17</property>
+                            <property name="width">1</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkSpinButton" id="lensAperture">
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="tooltip-text" translatable="yes">The aperture (f-number) the frames were taken at</property>
+                            <property name="adjustment">lensApertureAdjust</property>
+                            <property name="digits">1</property>
+                            <property name="numeric">True</property>
+                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">1</property>
+                            <property name="top-attach">17</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="lensDistortion">
+                            <property name="label" translatable="yes">Distortion</property>
+                            <property name="visible">True</property>
+                            <property name="sensitive">False</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="tooltip-text" translatable="yes">Corrects the lens distortion</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="setLensCorrection" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">18</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="lensTCA">
+                            <property name="label" translatable="yes">Chromatic Aberration (TCA)</property>
+                            <property name="visible">True</property>
+                            <property name="sensitive">False</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="tooltip-text" translatable="yes">Corrects the lateral chromatic aberration.  Can't be used together with Align RGB.</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="setLensCorrection" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">19</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkCheckButton" id="lensVignetting">
+                            <property name="label" translatable="yes">Vignetting</property>
+                            <property name="visible">True</property>
+                            <property name="sensitive">False</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="tooltip-text" translatable="yes">Corrects the darkening towards the corners</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="setLensCorrection" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">20</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="lensStatus">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">No lens selected</property>
+                            <property name="wrap">True</property>
+                            <property name="max-width-chars">30</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">21</property>
                             <property name="width">2</property>
                           </packing>
                         </child>
@@ -1570,6 +1828,132 @@ Note: Drift adjustment will still crop the image.</property>
                                 <property name="margin-bottom">10</property>
                                 <property name="orientation">vertical</property>
                                 <child>
+                                  <object class="GtkExpander" id="levels">
+                                    <property name="visible">True</property>
+                                    <property name="can-focus">True</property>
+                                    <property name="margin-bottom">10</property>
+                                    <property name="expanded">True</property>
+                                    <child>
+                                      <!-- n-columns=3 n-rows=2 -->
+                                      <object class="GtkGrid">
+                                        <property name="visible">True</property>
+                                        <property name="can-focus">False</property>
+                                        <property name="margin-top">5</property>
+                                        <property name="column-spacing">5</property>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">False</property>
+                                            <property name="tooltip-text" translatable="yes">The level subtracted from all channels to make the background black, as a percentage of full scale.  Auto estimates it from the darkest area of the image.</property>
+                                            <property name="label" translatable="yes">Black Level:</property>
+                                            <property name="width-chars">12</property>
+                                            <property name="xalign">1</property>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">0</property>
+                                            <property name="top-attach">0</property>
+                                          </packing>
+                                        </child>
+                                        <child>
+                                          <object class="GtkScale" id="blackLevel">
+                                            <property name="width-request">275</property>
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">True</property>
+                                            <property name="adjustment">blackLevelAdjust</property>
+                                            <property name="round-digits">2</property>
+                                            <property name="digits">2</property>
+                                            <property name="value-pos">left</property>
+                                            <signal name="format-value" handler="formatBlackLevel" swapped="no"/>
+                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">1</property>
+                                            <property name="top-attach">0</property>
+                                          </packing>
+                                        </child>
+                                        <child>
+                                          <object class="GtkCheckButton" id="autoBlackLevel">
+                                            <property name="label" translatable="yes">Auto</property>
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">True</property>
+                                            <property name="receives-default">False</property>
+                                            <property name="tooltip-text" translatable="yes">Estimate the black level from the image.  It is recalculated when the image changes.</property>
+                                            <property name="valign">end</property>
+                                            <property name="active">True</property>
+                                            <property name="draw-indicator">True</property>
+                                            <signal name="toggled" handler="setAutoLevels" swapped="no"/>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">2</property>
+                                            <property name="top-attach">0</property>
+                                          </packing>
+                                        </child>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">False</property>
+                                            <property name="tooltip-text" translatable="yes">Adjusts the brightness of the image in stops (EV).  Auto makes the brightest value full scale.</property>
+                                            <property name="label" translatable="yes">Exposure:</property>
+                                            <property name="xalign">1</property>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">0</property>
+                                            <property name="top-attach">1</property>
+                                          </packing>
+                                        </child>
+                                        <child>
+                                          <object class="GtkScale" id="exposure">
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">True</property>
+                                            <property name="adjustment">exposureAdjust</property>
+                                            <property name="round-digits">1</property>
+                                            <property name="digits">1</property>
+                                            <property name="value-pos">left</property>
+                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">1</property>
+                                            <property name="top-attach">1</property>
+                                          </packing>
+                                        </child>
+                                        <child>
+                                          <object class="GtkCheckButton" id="autoExposure">
+                                            <property name="label" translatable="yes">Auto</property>
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">True</property>
+                                            <property name="receives-default">False</property>
+                                            <property name="tooltip-text" translatable="yes">Set the exposure so the brightest value is full scale.  It is recalculated when the image changes.</property>
+                                            <property name="valign">end</property>
+                                            <property name="active">True</property>
+                                            <property name="draw-indicator">True</property>
+                                            <signal name="toggled" handler="setAutoLevels" swapped="no"/>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">2</property>
+                                            <property name="top-attach">1</property>
+                                          </packing>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child type="label">
+                                      <object class="GtkLabel">
+                                        <property name="visible">True</property>
+                                        <property name="can-focus">False</property>
+                                        <property name="tooltip-text" translatable="yes">Set the black point and brightness of the linear data before it is sharpened.</property>
+                                        <property name="label" translatable="yes">Levels</property>
+                                        <attributes>
+                                          <attribute name="weight" value="bold"/>
+                                        </attributes>
+                                      </object>
+                                    </child>
+                                  </object>
+                                  <packing>
+                                    <property name="expand">False</property>
+                                    <property name="fill">True</property>
+                                    <property name="position">0</property>
+                                  </packing>
+                                </child>
+                                <child>
                                   <object class="GtkExpander" id="wavelets">
                                     <property name="visible">True</property>
                                     <property name="can-focus">True</property>
@@ -1983,7 +2367,7 @@ Note: Drift adjustment will still crop the image.</property>
                                   <packing>
                                     <property name="expand">False</property>
                                     <property name="fill">True</property>
-                                    <property name="position">0</property>
+                                    <property name="position">1</property>
                                   </packing>
                                 </child>
                                 <child>
@@ -2510,7 +2894,7 @@ Note: Drift adjustment will still crop the image.</property>
                                   <packing>
                                     <property name="expand">False</property>
                                     <property name="fill">True</property>
-                                    <property name="position">1</property>
+                                    <property name="position">2</property>
                                   </packing>
                                 </child>
                                 <child>
@@ -2749,7 +3133,7 @@ Note: Drift adjustment will still crop the image.</property>
                                   <packing>
                                     <property name="expand">False</property>
                                     <property name="fill">True</property>
-                                    <property name="position">2</property>
+                                    <property name="position">3</property>
                                   </packing>
                                 </child>
                                 <child>
@@ -2758,7 +3142,7 @@ Note: Drift adjustment will still crop the image.</property>
                                     <property name="can-focus">True</property>
                                     <property name="margin-bottom">10</property>
                                     <child>
-                                      <!-- n-columns=3 n-rows=9 -->
+                                      <!-- n-columns=3 n-rows=7 -->
                                       <object class="GtkGrid">
                                         <property name="visible">True</property>
                                         <property name="can-focus">False</property>
@@ -2768,73 +3152,29 @@ Note: Drift adjustment will still crop the image.</property>
                                           <object class="GtkLabel">
                                             <property name="visible">True</property>
                                             <property name="can-focus">False</property>
-                                            <property name="tooltip-text" translatable="yes">Controls the mid-tones of the image.</property>
-                                            <property name="label" translatable="yes">Gamma:</property>
-                                            <property name="xalign">1</property>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">0</property>
-                                            <property name="top-attach">2</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkLabel">
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">False</property>
-                                            <property name="tooltip-text" translatable="yes">Controls the where the black level is.  Increasing this value darkens the overall image.</property>
-                                            <property name="label" translatable="yes">Black Level:</property>
-                                            <property name="width-chars">12</property>
-                                            <property name="xalign">1</property>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">0</property>
-                                            <property name="top-attach">1</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkScale" id="gamma">
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">True</property>
-                                            <property name="adjustment">gammaAdjust</property>
-                                            <property name="round-digits">0</property>
-                                            <property name="digits">0</property>
-                                            <property name="value-pos">left</property>
-                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">1</property>
-                                            <property name="top-attach">2</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkScale" id="blackLevel">
-                                            <property name="width-request">275</property>
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">True</property>
-                                            <property name="margin-top">10</property>
-                                            <property name="adjustment">blackLevelAdjust</property>
-                                            <property name="round-digits">0</property>
-                                            <property name="digits">0</property>
-                                            <property name="value-pos">left</property>
-                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">1</property>
-                                            <property name="top-attach">1</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkLabel">
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">False</property>
                                             <property name="tooltip-text" translatable="yes">Adjusts the red intensity.</property>
-                                            <property name="margin-top">10</property>
                                             <property name="label" translatable="yes">Red:</property>
                                             <property name="xalign">1</property>
                                           </object>
                                           <packing>
                                             <property name="left-attach">0</property>
-                                            <property name="top-attach">4</property>
+                                            <property name="top-attach">0</property>
+                                          </packing>
+                                        </child>
+                                        <child>
+                                          <object class="GtkScale" id="red">
+                                            <property name="width-request">275</property>
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">True</property>
+                                            <property name="adjustment">redAdjust</property>
+                                            <property name="round-digits">0</property>
+                                            <property name="digits">0</property>
+                                            <property name="value-pos">left</property>
+                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">1</property>
+                                            <property name="top-attach">0</property>
                                           </packing>
                                         </child>
                                         <child>
@@ -2847,36 +3187,7 @@ Note: Drift adjustment will still crop the image.</property>
                                           </object>
                                           <packing>
                                             <property name="left-attach">0</property>
-                                            <property name="top-attach">5</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkLabel">
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">False</property>
-                                            <property name="tooltip-text" translatable="yes">Adjusts the blue intensity.</property>
-                                            <property name="label" translatable="yes">Blue:</property>
-                                            <property name="xalign">1</property>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">0</property>
-                                            <property name="top-attach">6</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkScale" id="red">
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">True</property>
-                                            <property name="margin-top">10</property>
-                                            <property name="adjustment">redAdjust</property>
-                                            <property name="round-digits">0</property>
-                                            <property name="digits">0</property>
-                                            <property name="value-pos">left</property>
-                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">1</property>
-                                            <property name="top-attach">4</property>
+                                            <property name="top-attach">1</property>
                                           </packing>
                                         </child>
                                         <child>
@@ -2891,7 +3202,20 @@ Note: Drift adjustment will still crop the image.</property>
                                           </object>
                                           <packing>
                                             <property name="left-attach">1</property>
-                                            <property name="top-attach">5</property>
+                                            <property name="top-attach">1</property>
+                                          </packing>
+                                        </child>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">False</property>
+                                            <property name="tooltip-text" translatable="yes">Adjusts the blue intensity.</property>
+                                            <property name="label" translatable="yes">Blue:</property>
+                                            <property name="xalign">1</property>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">0</property>
+                                            <property name="top-attach">2</property>
                                           </packing>
                                         </child>
                                         <child>
@@ -2906,26 +3230,28 @@ Note: Drift adjustment will still crop the image.</property>
                                           </object>
                                           <packing>
                                             <property name="left-attach">1</property>
-                                            <property name="top-attach">6</property>
+                                            <property name="top-attach">2</property>
                                           </packing>
                                         </child>
                                         <child>
                                           <object class="GtkLabel">
                                             <property name="visible">True</property>
                                             <property name="can-focus">False</property>
+                                            <property name="margin-top">10</property>
                                             <property name="tooltip-text" translatable="yes">Adjusts the color intensity.</property>
                                             <property name="label" translatable="yes">Saturation:</property>
                                             <property name="xalign">1</property>
                                           </object>
                                           <packing>
                                             <property name="left-attach">0</property>
-                                            <property name="top-attach">7</property>
+                                            <property name="top-attach">3</property>
                                           </packing>
                                         </child>
                                         <child>
                                           <object class="GtkScale" id="saturation">
                                             <property name="visible">True</property>
                                             <property name="can-focus">True</property>
+                                            <property name="margin-top">10</property>
                                             <property name="adjustment">saturationAdjust</property>
                                             <property name="round-digits">0</property>
                                             <property name="digits">0</property>
@@ -2934,59 +3260,20 @@ Note: Drift adjustment will still crop the image.</property>
                                           </object>
                                           <packing>
                                             <property name="left-attach">1</property>
-                                            <property name="top-attach">7</property>
+                                            <property name="top-attach">3</property>
                                           </packing>
                                         </child>
                                         <child>
                                           <object class="GtkLabel">
                                             <property name="visible">True</property>
                                             <property name="can-focus">False</property>
-                                            <property name="tooltip-text" translatable="yes">Adjusts the brightness of the image.</property>
-                                            <property name="label" translatable="yes">Value:</property>
-                                            <property name="xalign">1</property>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">0</property>
-                                            <property name="top-attach">3</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkScale" id="value">
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">True</property>
-                                            <property name="adjustment">valueAdjust</property>
-                                            <property name="round-digits">0</property>
-                                            <property name="digits">0</property>
-                                            <property name="value-pos">left</property>
-                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">1</property>
-                                            <property name="top-attach">3</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkImage" id="histImage">
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">False</property>
-                                          </object>
-                                          <packing>
-                                            <property name="left-attach">0</property>
-                                            <property name="top-attach">8</property>
-                                            <property name="width">2</property>
-                                          </packing>
-                                        </child>
-                                        <child>
-                                          <object class="GtkLabel">
-                                            <property name="visible">True</property>
-                                            <property name="can-focus">False</property>
-                                            <property name="tooltip-text" translatable="yes">Adjusts the color intensity.</property>
+                                            <property name="tooltip-text" translatable="yes">Brightens faint detail with a curve applied to the intensity, keeping the colors.</property>
                                             <property name="label" translatable="yes">Stretch Function:</property>
                                             <property name="xalign">1</property>
                                           </object>
                                           <packing>
                                             <property name="left-attach">0</property>
-                                            <property name="top-attach">0</property>
+                                            <property name="top-attach">4</property>
                                           </packing>
                                         </child>
                                         <child>
@@ -2996,46 +3283,57 @@ Note: Drift adjustment will still crop the image.</property>
                                             <property name="active">0</property>
                                             <items>
                                               <item id="0" translatable="yes">None</item>
-                                              <item id="1" translatable="yes">Linear</item>
-                                              <item id="2" translatable="yes">Square Root</item>
-                                              <item id="3" translatable="yes">Cube Root</item>
-                                              <item id="4" translatable="yes">Logarithm</item>
-                                              <item id="5" translatable="yes">ArcSinH</item>
+                                              <item id="1" translatable="yes">Square Root</item>
+                                              <item id="2" translatable="yes">Cube Root</item>
+                                              <item id="3" translatable="yes">Logarithm</item>
+                                              <item id="4" translatable="yes">ArcSinH</item>
                                             </items>
                                             <signal name="changed" handler="processImage" swapped="no"/>
                                             <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
                                           </object>
                                           <packing>
                                             <property name="left-attach">1</property>
-                                            <property name="top-attach">0</property>
+                                            <property name="top-attach">4</property>
                                           </packing>
                                         </child>
                                         <child>
-                                          <placeholder/>
+                                          <object class="GtkLabel">
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">False</property>
+                                            <property name="tooltip-text" translatable="yes">Controls the mid-tones of the image.</property>
+                                            <property name="label" translatable="yes">Gamma:</property>
+                                            <property name="xalign">1</property>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">0</property>
+                                            <property name="top-attach">5</property>
+                                          </packing>
                                         </child>
                                         <child>
-                                          <placeholder/>
+                                          <object class="GtkScale" id="gamma">
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">True</property>
+                                            <property name="adjustment">gammaAdjust</property>
+                                            <property name="round-digits">0</property>
+                                            <property name="digits">0</property>
+                                            <property name="value-pos">left</property>
+                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">1</property>
+                                            <property name="top-attach">5</property>
+                                          </packing>
                                         </child>
                                         <child>
-                                          <placeholder/>
-                                        </child>
-                                        <child>
-                                          <placeholder/>
-                                        </child>
-                                        <child>
-                                          <placeholder/>
-                                        </child>
-                                        <child>
-                                          <placeholder/>
-                                        </child>
-                                        <child>
-                                          <placeholder/>
-                                        </child>
-                                        <child>
-                                          <placeholder/>
-                                        </child>
-                                        <child>
-                                          <placeholder/>
+                                          <object class="GtkImage" id="histImage">
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">False</property>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">0</property>
+                                            <property name="top-attach">6</property>
+                                            <property name="width">3</property>
+                                          </packing>
                                         </child>
                                       </object>
                                     </child>
@@ -3043,8 +3341,8 @@ Note: Drift adjustment will still crop the image.</property>
                                       <object class="GtkLabel">
                                         <property name="visible">True</property>
                                         <property name="can-focus">False</property>
-                                        <property name="tooltip-text" translatable="yes">Adjust the colors and brightness of the image.</property>
-                                        <property name="label" translatable="yes">Colors &amp; Brightness</property>
+                                        <property name="tooltip-text" translatable="yes">Adjust the color balance, then the saturation and tone curve of the image.</property>
+                                        <property name="label" translatable="yes">Colors &amp; Tone</property>
                                         <attributes>
                                           <attribute name="weight" value="bold"/>
                                         </attributes>
@@ -3054,21 +3352,22 @@ Note: Drift adjustment will still crop the image.</property>
                                   <packing>
                                     <property name="expand">False</property>
                                     <property name="fill">True</property>
-                                    <property name="position">3</property>
+                                    <property name="position">4</property>
                                   </packing>
                                 </child>
                                 <child>
-                                  <object class="GtkButton" id="saveButton">
-                                    <property name="label" translatable="yes">Save Image</property>
+                                  <object class="GtkButton" id="exportButton">
+                                    <property name="label" translatable="yes">Export Image</property>
                                     <property name="visible">True</property>
                                     <property name="can-focus">True</property>
                                     <property name="receives-default">True</property>
-                                    <signal name="clicked" handler="saveFileDialog" swapped="no"/>
+                                    <property name="tooltip-text" translatable="yes">Go to the Export tab to save the image.</property>
+                                    <signal name="clicked" handler="showExportTab" swapped="no"/>
                                   </object>
                                   <packing>
                                     <property name="expand">False</property>
                                     <property name="fill">True</property>
-                                    <property name="position">4</property>
+                                    <property name="position">5</property>
                                   </packing>
                                 </child>
                               </object>
@@ -3111,6 +3410,220 @@ Note: Drift adjustment will still crop the image.</property>
                       </object>
                       <packing>
                         <property name="position">3</property>
+                        <property name="tab-fill">False</property>
+                      </packing>
+                    </child>
+                    <child>
+                      <!-- n-columns=2 n-rows=12 -->
+                      <object class="GtkGrid" id="exportTab">
+                        <property name="visible">True</property>
+                        <property name="can-focus">False</property>
+                        <property name="margin-left">10</property>
+                        <property name="margin-right">10</property>
+                        <property name="margin-top">10</property>
+                        <property name="margin-bottom">10</property>
+                        <property name="row-spacing">5</property>
+                        <property name="column-homogeneous">True</property>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">File Type</property>
+                            <attributes>
+                              <attribute name="weight" value="bold"/>
+                            </attributes>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">0</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Choose the format of the saved image</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">1</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkComboBoxText" id="fileType">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="margin-bottom">10</property>
+                            <property name="active">0</property>
+                            <items>
+                              <item id="0" translatable="yes">PNG</item>
+                              <item id="1" translatable="yes">JPEG</item>
+                              <item id="2" translatable="yes">TIFF</item>
+                              <item id="3" translatable="yes">EXR</item>
+                            </items>
+                            <signal name="changed" handler="setFileType" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">2</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Pixel Format</property>
+                            <attributes>
+                              <attribute name="weight" value="bold"/>
+                            </attributes>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">3</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="label" translatable="yes">Choose how many bits are stored per channel</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">4</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkRadioButton" id="pixelFormat8">
+                            <property name="label" translatable="yes">8-bit</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="active">True</property>
+                            <property name="draw-indicator">True</property>
+                            <signal name="toggled" handler="updateExportNotice" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">5</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkRadioButton" id="pixelFormat16">
+                            <property name="label" translatable="yes">16-bit</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="draw-indicator">True</property>
+                            <property name="group">pixelFormat8</property>
+                            <signal name="toggled" handler="updateExportNotice" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">6</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkRadioButton" id="pixelFormat16Float">
+                            <property name="label" translatable="yes">16-bit float</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="draw-indicator">True</property>
+                            <property name="group">pixelFormat8</property>
+                            <signal name="toggled" handler="updateExportNotice" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">7</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkRadioButton" id="pixelFormat32Float">
+                            <property name="label" translatable="yes">32-bit float</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">False</property>
+                            <property name="draw-indicator">True</property>
+                            <property name="group">pixelFormat8</property>
+                            <signal name="toggled" handler="updateExportNotice" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">8</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="margin-top">5</property>
+                            <property name="margin-bottom">10</property>
+                            <property name="label" translatable="yes">8-bit and 16-bit: sRGB primaries and tone curve.
+Float: linear tone, input primaries stored in the file.</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">9</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="nonLinearNotice">
+                            <property name="can-focus">False</property>
+                            <property name="no-show-all">True</property>
+                            <property name="margin-bottom">10</property>
+                            <property name="label" translatable="yes">Stretch/Gamma are applied, so this file is not linear and may look brighter in other apps.</property>
+                            <property name="wrap">True</property>
+                            <property name="max-width-chars">40</property>
+                            <attributes>
+                              <attribute name="style" value="italic"/>
+                            </attributes>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">10</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkButton" id="saveButton">
+                            <property name="label" translatable="yes">Save Image</property>
+                            <property name="visible">True</property>
+                            <property name="can-focus">True</property>
+                            <property name="receives-default">True</property>
+                            <signal name="clicked" handler="saveFileDialog" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">11</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                      </object>
+                      <packing>
+                        <property name="position">4</property>
+                      </packing>
+                    </child>
+                    <child type="tab">
+                      <object class="GtkLabel">
+                        <property name="height-request">30</property>
+                        <property name="visible">True</property>
+                        <property name="can-focus">False</property>
+                        <property name="label" translatable="yes">Export</property>
+                        <property name="width-chars">7</property>
+                      </object>
+                      <packing>
+                        <property name="position">4</property>
                         <property name="tab-fill">False</property>
                       </packing>
                     </child>
@@ -3212,20 +3725,6 @@ Note: Drift adjustment will still crop the image.</property>
                       </packing>
                     </child>
                     <child>
-                      <object class="GtkLabel">
-                        <property name="width-request">50</property>
-                        <property name="visible">True</property>
-                        <property name="can-focus">False</property>
-                        <property name="margin-left">10</property>
-                        <property name="label" translatable="yes">Color:</property>
-                      </object>
-                      <packing>
-                        <property name="expand">False</property>
-                        <property name="fill">True</property>
-                        <property name="position">2</property>
-                      </packing>
-                    </child>
-                    <child>
                       <object class="GtkBox">
                         <property name="visible">True</property>
                         <property name="can-focus">False</property>
@@ -3277,33 +3776,7 @@ Note: Drift adjustment will still crop the image.</property>
                         <property name="expand">False</property>
                         <property name="fill">True</property>
                         <property name="pack-type">end</property>
-                        <property name="position">3</property>
-                      </packing>
-                    </child>
-                    <child>
-                      <object class="GtkComboBoxText" id="colorMode">
-                        <property name="visible">True</property>
-                        <property name="can-focus">False</property>
-                        <property name="active">0</property>
-                        <items>
-                          <item id="0" translatable="yes">Auto</item>
-                          <item id="1" translatable="yes">RGB</item>
-                          <item id="2" translatable="yes">Grayscale</item>
-                          <item id="3" translatable="yes">Bayer RGGB</item>
-                          <item id="4" translatable="yes">Bayer GRBG</item>
-                          <item id="5" translatable="yes">Bayer GBRG</item>
-                          <item id="6" translatable="yes">Bayer BGGR</item>
-                          <item id="7" translatable="yes">Bayer RGGB (VNG)</item>
-                          <item id="8" translatable="yes">Bayer GRBG (VNG)</item>
-                          <item id="9" translatable="yes">Bayer GBRG (VNG)</item>
-                          <item id="10" translatable="yes">Bayer BGGR (VNG)</item>
-                        </items>
-                        <signal name="changed" handler="setColorMode" swapped="no"/>
-                      </object>
-                      <packing>
-                        <property name="expand">False</property>
-                        <property name="fill">True</property>
-                        <property name="position">4</property>
+                        <property name="position">2</property>
                       </packing>
                     </child>
                   </object>

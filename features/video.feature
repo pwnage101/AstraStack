@@ -20,6 +20,9 @@ Feature: Video
         And I wait until active tab is "Stack"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I press "exportButton"
+        And I select "PNG" from "fileType"
+        And I check "pixelFormat8"
         And I async press "saveButton"
         And I choose output file "jupiter.png" from "saveDialog"
         Then output "jupiter.png" and reference "jupiter.png" should be equal
@@ -39,6 +42,9 @@ Feature: Video
         And I wait until active tab is "Stack"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I press "exportButton"
+        And I select "PNG" from "fileType"
+        And I check "pixelFormat8"
         And I async press "saveButton"
         And I choose output file "jupiter2.png" from "saveDialog"
         Then output "jupiter2.png" and reference "jupiter2.png" should be equal
@@ -55,6 +61,9 @@ Feature: Video
         And I uncheck "autoCrop"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I press "exportButton"
+        And I select "PNG" from "fileType"
+        And I check "pixelFormat8"
         And I async press "saveButton"
         And I choose output file "jupiter4.png" from "saveDialog"
         Then output "jupiter4.png" and reference "jupiter4.png" should be equal
@@ -71,6 +80,9 @@ Feature: Video
         And I uncheck "autoCrop"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I press "exportButton"
+        And I select "PNG" from "fileType"
+        And I check "pixelFormat8"
         And I async press "saveButton"
         And I choose output file "jupiter5.png" from "saveDialog"
         Then output "jupiter5.png" and reference "jupiter5.png" should be equal
@@ -93,6 +105,9 @@ Feature: Video
         And I wait until active tab is "Stack"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I press "exportButton"
+        And I select "PNG" from "fileType"
+        And I check "pixelFormat8"
         And I async press "saveButton"
         And I choose output file "jupiter3.png" from "saveDialog"
         Then output "jupiter3.png" and reference "jupiter3.png" should be equal
@@ -109,6 +124,9 @@ Feature: Video
         And I select "Lanczos" from "drizzleInterpolation"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I press "exportButton"
+        And I select "PNG" from "fileType"
+        And I check "pixelFormat8"
         And I async press "saveButton"
         And I choose output file "Jupiter2X.png" from "saveDialog"
         Then output "Jupiter2X.png" and reference "Jupiter2X.png" should be equal
@@ -126,6 +144,9 @@ Feature: Video
         And I select "Lanczos" from "drizzleInterpolation"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I press "exportButton"
+        And I select "PNG" from "fileType"
+        And I check "pixelFormat8"
         And I async press "saveButton"
         And I choose output file "Jupiter2X_1cpu.png" from "saveDialog"
         Then output "Jupiter2X_1cpu.png" and reference "Jupiter2X.png" should be equal
@@ -142,6 +163,25 @@ Feature: Video
         And I select "Lanczos" from "drizzleInterpolation"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I press "exportButton"
+        And I select "PNG" from "fileType"
+        And I check "pixelFormat8"
         And I async press "saveButton"
         And I choose output file "Jupiter0.5X.png" from "saveDialog"
         Then output "Jupiter0.5X.png" and reference "Jupiter0.5X.png" should be equal
+        
+    Scenario: Changing color mode discards stacking results
+        Given I am on tab "Load"
+        And I async press "openVideo"
+        And I choose input file "Jupiter.mp4" from "openDialog"
+        And I wait until active tab is "Align"
+        And I select "Affine" from "transformation"
+        And I press "alignButton"
+        And I wait until active tab is "Stack"
+        And I press "stackButton"
+        And I wait until active tab is "Process"
+        And I am on tab "Load"
+        And I select "Grayscale" from "colorMode"
+        Then "alignTab" should be sensitive
+        And "stackTab" should not be sensitive
+        And "processTab" should not be sensitive

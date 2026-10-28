@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import shutil
 import tempfile
 from itertools import count
@@ -45,7 +46,17 @@ def before_scenario(context: Context, scenario: Scenario) -> None:
 def after_scenario(context: Context, scenario: Scenario) -> None:
     if(not hasattr(context, "gtkThread")):
         return
-    g.ui.window.close()
+    # Let processing finish and close the window from the GTK thread, so no GTK work overlaps the next scenario's UI
+    ui = g.ui
+    while(ui.processThread is not None and ui.processThread.is_alive()):
+        time.sleep(0.01)
+    def close() -> None:
+        # Dialogs are toplevels GTK keeps alive until destroyed; a hidden file chooser left from an earlier scenario
+        # keeps updating its path bar, which can make GTK abort (gtkpathbar.c set_button_image_get_info_cb)
+        for dialog in (ui.openDialog, ui.saveDialog):
+            dialog.destroy()
+        ui.window.close()
+    GLib.idle_add(close)
     context.gtkThread.join(GTK_TIMEOUT)
     assert not context.gtkThread.is_alive(), "The GTK main loop did not exit"
 

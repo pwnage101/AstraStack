@@ -1,67 +1,106 @@
+from __future__ import annotations
 from lazy import lazy
 cv2 = lazy("cv2")
 np = lazy("numpy")
 pywt = lazy("pywt")
 import math
 import copy
+import gc
 from concurrent.futures import ProcessPoolExecutor, wait
 from multiprocessing import Manager, Lock
 from time import sleep
 from deconvolution import *
 from Video import Video
 from Globals import *
+import ColorSpace
+import Export
 
 pool = ProcessPoolExecutor(3)
-
-def colorAdjust(C, adjust):
-    C *= (adjust/100)*(g.value/100)
-    return C
 
 class Process:
 
     STRETCH_NONE = 0
-    STRETCH_LINEAR = 1
-    STRETCH_SQRT = 2
-    STRETCH_CBRT = 3
-    STRETCH_LOG = 4
-    STRETCH_ASINH = 5
+    STRETCH_SQRT = 1
+    STRETCH_CBRT = 2
+    STRETCH_LOG = 3
+    STRETCH_ASINH = 4
     
     LEVEL = 5
+    
+    # Exposure slider range in EV
+    EXPOSURE_MIN = -5
+    EXPOSURE_MAX = 10
+    
+    # Black Level slider: log10 of the percentage of full scale, the far left end is 0
+    BLACK_LEVEL_MIN = -2
+    BLACK_LEVEL_MAX = 2
     
     # This is a crude estimate on how much memory will be used by the sharpening
     # Width * Height * 3Channels * 4bytes * 4coefficients * 5layers * 2(worst case from copying every coefficients layer)
     def estimateMemoryUsage(width, height):
         return width*height*3*4*4*Process.LEVEL*2
-
-    def __init__(self, stackedImage, isFile=False):
+    
+    def __init__(self, stackedImage: np.ndarray | str, isFile: bool = False) -> None:
         if(isFile):
             # Single image provided
             video = Video()
-            stackedImage = video.getFrame(None, stackedImage, g.actualColor())
+            stackedImage = video.getFrame(None, stackedImage, g.actualColor(), lens=g.lens)
         else:
             # Use the higher bit depth version from the stacking process
             pass
-        self.stackedImage = cv2.cvtColor(stackedImage, cv2.COLOR_BGR2RGB)
+        # Linear, in the input's primaries
+        self.inputImage = cv2.cvtColor(stackedImage, cv2.COLOR_BGR2RGB)
+        self.colorSpace = g.actualColorSpace()
+        self.luminance = ColorSpace.luminanceWeights(self.colorSpace)
+        self.white = ColorSpace.whiteRGB(self.colorSpace)
+        self.autoBlackLevel = estimateBlackLevel(self.inputImage)
+        self.maxValue = float(self.inputImage.max())
         self.h, self.w = stackedImage.shape[:2]
         self.mask = None
         self.thresh = None
+        self.calculateCoefficients()
         self.sharpenedImage = self.stackedImage
         self.debluredImage = self.stackedImage
         self.deringedImage = self.stackedImage
         self.finalImage = self.stackedImage
-        self.calculateCoefficients()
+        self.processingRecord = Export.processingRecord(blackLevel=self.blackLevel,
+                                                        exposure=self.exposure,
+                                                        gains=(1.0, 1.0, 1.0),
+                                                        saturation=1.0,
+                                                        stretch=STRETCH_NAMES[Process.STRETCH_NONE],
+                                                        gamma=1.0)
+        self.processLevelsAgain = False
         self.processAgain = False
         self.processDeblurAgain = False
         self.processDeringAgain = False
         self.processColorAgain = False
         
-    def run(self, processAgain=True, processDeblurAgain=False, processDeringAgain=False, processColorAgain=False):
+    def run(self,
+            processAgain: bool = True,
+            processDeblurAgain: bool = False,
+            processDeringAgain: bool = False,
+            processColorAgain: bool = False,
+            processLevelsAgain: bool = False) -> None:
+        self.processLevelsAgain = processLevelsAgain
         self.processAgain = processAgain
         self.processDeblurAgain = processDeblurAgain
         self.processDeringAgain = processDeringAgain
         self.processColorAgain = processColorAgain
-        while(self.processAgain or self.processDeblurAgain or self.processDeringAgain or self.processColorAgain):
-            if(self.processAgain):
+        while(self.processLevelsAgain or self.processAgain or self.processDeblurAgain or
+              self.processDeringAgain or self.processColorAgain):
+            if(self.processLevelsAgain):
+                # Process black level & exposure, sharpening, deblur and color
+                self.processLevelsAgain = False
+                self.processAgain = False
+                self.processDeblurAgain = False
+                self.processDeringAgain = False
+                self.processColorAgain = False
+                self.calculateCoefficients()
+                self.sharpenLayers()
+                self.deblur()
+                self.dering()
+                self.processColor()
+            elif(self.processAgain):
                 # Process sharpening, deblur and color
                 self.processAgain = False
                 self.processDeblurAgain = False
@@ -97,32 +136,38 @@ class Process:
                 self.processColor()
             g.ui.finishedProcessing()
         
-    # Calculates the wavelet coefficents for each channel
-    def calculateCoefficients(self):
-        # Stretch Function
-        self.stackedImage = np.clip(self.stackedImage, 0, 255)
-        if(g.stretchFunction is not Process.STRETCH_NONE):
-            gauss = cv2.resize(self.stackedImage, (100, 100), interpolation=cv2.INTER_LINEAR)
-            gauss = cv2.cvtColor(gauss, cv2.COLOR_RGB2HLS)
-            (H, V, S) = cv2.split(gauss)
-            V = cv2.GaussianBlur(V, (0,0), 2)
-            low = V.min()
-            self.stackedImage -= low
-            self.stackedImage = np.clip(self.stackedImage, 0, 255)
-        if(g.stretchFunction == Process.STRETCH_SQRT):
-            self.stackedImage = np.ma.sqrt(self.stackedImage)
-        elif(g.stretchFunction == Process.STRETCH_CBRT):
-            self.stackedImage = np.cbrt(self.stackedImage)
-        elif(g.stretchFunction == Process.STRETCH_LOG):
-            self.stackedImage = np.log((self.stackedImage+1))
-        elif(g.stretchFunction == Process.STRETCH_ASINH):
-            self.stackedImage = np.arcsinh(self.stackedImage)
-        if(g.stretchFunction is not Process.STRETCH_NONE):
-            self.stackedImage = cv2.normalize(self.stackedImage, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+    def levels(self) -> tuple[float, float]:
+        """Returns the black level and exposure to use, computed for the toggles that are automatic.
 
-        (R, G, B) = cv2.split(self.stackedImage)
+        Returns:
+            The black level (fraction of full scale) and the exposure (EV).
+        """
+        if(g.autoBlackLevel):
+            blackLevel = self.autoBlackLevel
+        else:
+            blackLevel = g.blackLevel
+        if(g.autoExposure):
+            exposure = autoExposure(self.maxValue, blackLevel)
+        else:
+            exposure = g.exposure
+        return (blackLevel, exposure)
+    
+    # Applies the black level and exposure, then calculates the wavelet coefficents for each channel
+    def calculateCoefficients(self) -> None:
+        (self.blackLevel, self.exposure) = self.levels()
+        self.stackedImage = applyLevels(img=self.inputImage, blackLevel=self.blackLevel, exposure=self.exposure)
 
-        with Manager() as manager:
+        # Wavelets run on square root encoded data, which evens out photon noise
+        (R, G, B) = cv2.split(sqrtEncode(self.stackedImage))
+
+        # Frozen so the forked manager process never collects the objects it inherits (see UI.setThreads), without
+        # collecting them first since this can run outside the GTK thread
+        gc.freeze()
+        try:
+            manager = Manager()
+        finally:
+            gc.unfreeze()
+        with manager:
             num = manager.Value('i', 0)
             lock = manager.Lock()
                 
@@ -134,7 +179,7 @@ class Process:
             wait(futures)
         
     # Sharpens each channel
-    def sharpenLayers(self):
+    def sharpenLayers(self) -> None:
         gCopy = cloneGlobals()
 
         futures = []
@@ -151,9 +196,9 @@ class Process:
             elif(result[0] == 'B'):
                 B = result[1]
                 
-        self.sharpenedImage = cv2.merge([R, G, B])[:self.h,:self.w]
+        self.sharpenedImage = sqrtDecode(cv2.merge([R, G, B])[:self.h,:self.w])
         
-    def deblur(self):
+    def deblur(self) -> None:
         img = self.sharpenedImage
         # Deconvolve
         if((g.deconvolveCircular and g.deconvolveCircularDiameter > 1) or 
@@ -184,15 +229,15 @@ class Process:
                 img *= factor
             except:
                 pass
-        img[img<0] = 0
         self.debluredImage = img
         
     # Apply dering/star mask to sharpened image
-    def dering(self):
+    def dering(self) -> None:
         if((g.showAdaptive and g.deringAdaptive > 0) or 
            (g.showDark and g.deringDark > 0) or 
            (g.showBright and g.deringBright > 0)):
-            gray = cv2.cvtColor(self.stackedImage, cv2.COLOR_RGB2GRAY)
+            # Thresholds work on display encoded 0-255 luminance
+            gray = displayLuminance(self.stackedImage, self.luminance)
             # Calculate Dark & Bright thresholds and merge them
             threshAdaptive = np.zeros((self.h, self.w), dtype = "uint8")
             threshDark = np.zeros((self.h, self.w), dtype = "uint8")
@@ -220,49 +265,220 @@ class Process:
             self.thresh = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
             mask = self.thresh.astype(np.float32)/255
             inv_mask = 1 - mask
-            orig = self.stackedImage.astype(np.float32)/255 * mask
+            orig = self.stackedImage * mask
             processed = self.debluredImage * inv_mask
             self.deringedImage = orig + processed
         else:
             self.thresh = cv2.cvtColor(np.zeros((self.h, self.w), dtype = "uint8"), cv2.COLOR_GRAY2RGB)
             self.deringedImage = self.debluredImage
     
-    # Apply brightness & color sliders
-    def processColor(self):
+    # Apply color gains, then the tone and color controls
+    def processColor(self) -> None:
         img = self.deringedImage
         
-        # Black Level
-        img = (img - (g.blackLevel/255))*(255/max(1, (255-g.blackLevel)))
+        gains = (g.redAdjust/100, g.greenAdjust/100, g.blueAdjust/100)
+        saturation = g.saturation/100
+        stretchFunction = g.stretchFunction
+        gamma = max(1, g.gamma)/100
+        
+        # Red/Green/Blue gains (linear)
+        img = img*np.array(gains, dtype=np.float32)
+        
+        # Ratio preserving tone and color
+        img = saturate(img=img, saturation=saturation, luminance=self.luminance, white=self.white)
+        img = stretch(img, stretchFunction)
+        img = applyGamma(img, gamma)
+        
+        self.processingRecord = Export.processingRecord(blackLevel=self.blackLevel,
+                                                        exposure=self.exposure,
+                                                        gains=gains,
+                                                        saturation=saturation,
+                                                        stretch=STRETCH_NAMES[stretchFunction],
+                                                        gamma=gamma)
+        self.finalImage = img.astype(np.float32)
+        
+def estimateBlackLevel(img: np.ndarray) -> float:
+    """Estimates the black level of the image.
 
-        # Decompose
-        (R, G, B) = cv2.split(img)
-        
-        # Color Adjust
-        R = colorAdjust(R, g.redAdjust)
-        G = colorAdjust(G, g.greenAdjust)
-        B = colorAdjust(B, g.blueAdjust)
-        
-        # Recompose
-        img = cv2.merge([R, G, B])
-        img = np.clip(img, 0, 1)
-        
-        # Saturation
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2HLS)
-        (H, V, S) = cv2.split(img)
-        S *= g.saturation/100
-        img = cv2.merge([H, V, S])
-        
-        img = cv2.cvtColor(img, cv2.COLOR_HLS2RGB)
-        
-        # Gamma
-        img = np.clip(img, 0, 1)
-        img = pow(img, 1/(max(1, g.gamma)/100))
-        
-        # Clip at 0 and 255
-        img *= 255
-        img = np.clip(img, 0, 255)
-        
-        self.finalImage = img
+    Args:
+        img: Linear RGB image.
+
+    Returns:
+        The minimum of the blurred, downscaled lightness ((max + min)/2 of the channels), clipped to 0-1.
+    """
+    small = cv2.resize(src=img, dsize=(100, 100), interpolation=cv2.INTER_LINEAR)
+    lightness = (small.max(axis=2) + small.min(axis=2))/2
+    lightness = cv2.GaussianBlur(src=lightness, ksize=(0,0), sigmaX=2)
+    return float(min(max(lightness.min(), 0), 1))
+
+def blackLevelFromSlider(value: float) -> float:
+    """Converts the Black Level slider value to a fraction of full scale.
+
+    Args:
+        value: Slider value, log10 of the percentage of full scale.
+
+    Returns:
+        The black level as a fraction of full scale, 0 at the far left end of the slider.
+    """
+    if(value <= Process.BLACK_LEVEL_MIN):
+        return 0
+    return 10**value/100
+
+def sliderFromBlackLevel(blackLevel: float) -> float:
+    """Converts a fraction of full scale to the Black Level slider value.
+
+    Args:
+        blackLevel: Black level as a fraction of full scale.
+
+    Returns:
+        The slider value, limited to the slider range.
+    """
+    if(blackLevel <= 10**Process.BLACK_LEVEL_MIN/100):
+        return Process.BLACK_LEVEL_MIN
+    return min(math.log10(blackLevel*100), Process.BLACK_LEVEL_MAX)
+
+def autoExposure(maxValue: float, blackLevel: float) -> float:
+    """Computes the exposure that puts the brightest value after black level subtraction at 1.0.
+
+    Args:
+        maxValue: Brightest channel value of the image.
+        blackLevel: Black level subtracted from the image.
+
+    Returns:
+        The exposure in EV, limited to the Exposure slider range (0 when nothing is above the black level).
+    """
+    if(maxValue - blackLevel <= 0):
+        return 0
+    return float(np.clip(a=-math.log2(maxValue - blackLevel), a_min=Process.EXPOSURE_MIN, a_max=Process.EXPOSURE_MAX))
+
+def applyLevels(img: np.ndarray, blackLevel: float, exposure: float) -> np.ndarray:
+    """Subtracts the black level and applies the exposure, without clipping.
+
+    Args:
+        img: Linear image.
+        blackLevel: Value subtracted from every channel.
+        exposure: Gain in EV (stops).
+
+    Returns:
+        The float32 image (img - blackLevel)*2^exposure.
+    """
+    return ((img - np.float32(blackLevel))*np.float32(2**exposure)).astype(np.float32)
+
+def sqrtEncode(img: np.ndarray) -> np.ndarray:
+    """Square root encodes the image, keeping the sign.
+
+    Args:
+        img: Linear image.
+
+    Returns:
+        The float32 image sqrt(|x|)*sign(x).
+    """
+    return (np.sqrt(np.abs(img))*np.sign(img)).astype(np.float32)
+
+def sqrtDecode(img: np.ndarray) -> np.ndarray:
+    """Decodes a square root encoded image back to linear.
+
+    Args:
+        img: Image encoded by sqrtEncode.
+
+    Returns:
+        The float32 image x*|x|.
+    """
+    return (img*np.abs(img)).astype(np.float32)
+
+def displayLuminance(img: np.ndarray, luminance: np.ndarray) -> np.ndarray:
+    """Computes the display encoded luminance, for thresholds that work on 0-255 values.
+
+    Args:
+        img: Linear RGB image.
+        luminance: Luminance weights of the image's primaries.
+
+    Returns:
+        The float32 luminance clipped to 0-1, encoded with the sRGB curve and scaled to 0-255.
+    """
+    Y = np.clip(a=img.dot(luminance), a_min=0, a_max=1)
+    return (ColorSpace.colour.models.eotf_inverse_sRGB(Y)*255).astype(np.float32)
+
+def scalePixels(img: np.ndarray, ratio: np.ndarray) -> np.ndarray:
+    """Multiplies all channels of each pixel by the same ratio.
+
+    Args:
+        img: RGB image (h x w x 3).
+        ratio: Ratio for each pixel (h x w), pixels with a NaN or infinite ratio become 0.
+
+    Returns:
+        The scaled image.
+    """
+    return img*np.nan_to_num(x=ratio, nan=0, posinf=0, neginf=0)[:,:,None]
+
+def saturate(img: np.ndarray, saturation: float, luminance: np.ndarray, white: np.ndarray) -> np.ndarray:
+    """Mixes each pixel toward its own luminance gray (Y*white), or away from it.
+
+    Args:
+        img: Linear RGB image.
+        saturation: Saturation factor, 0 is gray and 1 leaves the image unchanged.
+        luminance: Luminance weights of the image's primaries.
+        white: White point in the image's RGB with luminance 1.
+
+    Returns:
+        The float32 image Y*white + saturation*(rgb - Y*white), not clipped.
+    """
+    if(saturation == 1):
+        return img
+    gray = img.dot(luminance)[:,:,None]*white
+    return (gray + np.float32(saturation)*(img - gray)).astype(np.float32)
+
+# Stretch names as shown in the Stretch dropdown
+STRETCH_NAMES = {Process.STRETCH_NONE: "None",
+                 Process.STRETCH_SQRT: "Square Root",
+                 Process.STRETCH_CBRT: "Cube Root",
+                 Process.STRETCH_LOG: "Logarithm",
+                 Process.STRETCH_ASINH: "ArcSinH"}
+
+# Stretch curves (normalized so f(1) = 1) of the intensity
+STRETCH_CURVES = {Process.STRETCH_SQRT: lambda I: np.sqrt(I),
+                  Process.STRETCH_CBRT: lambda I: np.cbrt(I),
+                  Process.STRETCH_LOG: lambda I: np.log1p(255*I)/np.log(256),
+                  Process.STRETCH_ASINH: lambda I: np.arcsinh(255*I)/np.arcsinh(255)}
+
+def stretch(img: np.ndarray, stretchFunction: int) -> np.ndarray:
+    """Applies the stretch curve to the intensity (R+G+B)/3, keeping the R:G:B ratios.
+
+    Pixels with an intensity of 0 or less become 0, and pixels with a channel above 1.0 after the stretch are scaled
+    down as a whole.
+
+    Args:
+        img: Linear RGB image.
+        stretchFunction: One of the Process.STRETCH_* constants.
+
+    Returns:
+        The stretched float32 image, or img unchanged for Process.STRETCH_NONE.
+    """
+    if(stretchFunction not in STRETCH_CURVES):
+        return img
+    I = img.mean(axis=2)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        img = scalePixels(img, np.where(I > 0, STRETCH_CURVES[stretchFunction](np.maximum(I, 0))/I, 0))
+        peak = img.max(axis=2)
+        img = scalePixels(img, np.where(peak > 1, 1/peak, 1))
+    return img.astype(np.float32)
+
+def applyGamma(img: np.ndarray, gamma: float) -> np.ndarray:
+    """Applies the gamma to the intensity (R+G+B)/3, keeping the R:G:B ratios.
+
+    Args:
+        img: RGB image.
+        gamma: Gamma, the intensity I becomes I^(1/gamma); pixels with I <= 0 become 0.
+
+    Returns:
+        The float32 image, or img unchanged when gamma is 1.
+    """
+    if(gamma == 1):
+        return img
+    I = img.mean(axis=2)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        img = scalePixels(img, np.where(I > 0, np.power(np.maximum(I, 0), 1/gamma)/I, 0))
+    return img.astype(np.float32)
         
 # Calculates the wavelet coefficents for the specified channel
 def calculateChannelCoefficients(C, channel, num, lock):
@@ -279,7 +495,6 @@ def calculateChannelCoefficients(C, channel, num, lock):
     C = cv2.copyMakeBorder(C, 0, (2**Process.LEVEL - hR), 0, (2**Process.LEVEL - wR), cv2.BORDER_REFLECT)
     
     C =  np.float32(C)
-    C /= 255
 
     # Compute coefficients
     g.coeffs = list(pywt.swt2(C, 'haar', level=Process.LEVEL, trim_approx=True))
