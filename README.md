@@ -50,22 +50,22 @@ Building primarily uses pyinstaller to package into an executable.
 
 The project can also be built in Windows using a mingw64 installation.  You can install the python packages via the pacman package manager that it comes with, as well as with pip.  Inno Setup is also used to create an installer file.
 
-## Testing
-Testing uses the behave package and Gtk instructions are 'simulated' during testing.  To run the tests run the following:
+## End-To-End Testing
+
+E2E testing leverages the `behave` framework to simulate Gtk actions in the UI.
+Test scenarios are defined under `features/`, and you can run a specific
+scenario by calling `behave` directly:
 
 ```
-behave
-```
-If you want the tests to run 'headless' you can do one of the following:
-
-- if on X11:
-```
-xvfb-run behave
+behave features/single.feature:3
 ```
 
-- if on Wayland:
+However, running the full E2E test suite is normally best accomplished using
+parallel headless mode:
+
 ```
-wlheadless-run -- behave 2> /dev/null
+# Prerequisite: `weston` OS package.
+scripts/run_behave.sh
 ```
 
 # References
