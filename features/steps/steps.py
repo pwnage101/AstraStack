@@ -18,7 +18,7 @@ from Globals import g
 tabMap = {"Load": UI.LOAD_TAB,
           "Align": UI.ALIGN_TAB,
           "Stack": UI.STACK_TAB,
-          "Process": UI.SHARPEN_TAB}
+          "Process": UI.PROCESS_TAB}
 
 WIDGET_TIMEOUT = 10
 TEST_INPUTS_PATH = os.path.join(os.getcwd(), "features/testFiles/inputs")
