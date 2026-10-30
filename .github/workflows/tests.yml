@@ -43,3 +43,5 @@ jobs:
         run: pip install -r requirements.txt -r requirements_dev.txt
       - name: Run E2E tests
         run: scripts/run_behave.sh
+        env:
+          ASTRASTACK_TEST_SHARDS: "2"
