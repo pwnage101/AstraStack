@@ -522,10 +522,12 @@
       <pattern>*.jpg</pattern>
       <pattern>*.jpeg</pattern>
       <pattern>*.png</pattern>
+      <pattern>*.tif</pattern>
       <pattern>*.tiff</pattern>
       <pattern>*.JPG</pattern>
       <pattern>*.JPEG</pattern>
       <pattern>*.PNG</pattern>
+      <pattern>*.TIF</pattern>
       <pattern>*.TIFF</pattern>
     </patterns>
   </object>

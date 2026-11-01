@@ -10,6 +10,7 @@ from WorkerPools import FRAME_POOL
 from Video import Video
 from Align import Align
 from ProgressBar import *
+import ColorSpace
 
 class Stack:
 
@@ -106,13 +107,16 @@ class Stack:
         self.refBG = transform(ref, None, M,
                                0, 0, 0, 0, g)
         
-    # Aligns the RGB channels to help reduce chromatic aberrations
-    def alignChannels(self, progress):
+    # Aligns the RGB channels to help reduce chromatic aberrations, registering sRGB-encoded copies
+    def alignChannels(self, progress: ProgressBar) -> None:
         h, w = self.stackedImage.shape[:2]
-        gray = cv2.cvtColor(self.stackedImage, cv2.COLOR_BGR2GRAY)
+        encoded = ColorSpace.displayEncode(img=np.ascontiguousarray(self.stackedImage[:,:,::-1]),
+                                           workingSpace=g.actualWorkingSpace())
+        encoded = np.ascontiguousarray(encoded[:,:,::-1])
+        gray = cv2.cvtColor(encoded, cv2.COLOR_BGR2GRAY)
         sr = pystackreg.StackReg(Align.TRANSLATION)
         
-        for i, C in enumerate(cv2.split(self.stackedImage)):
+        for i, C in enumerate(cv2.split(encoded)):
             M = sr.register(C, gray)
             M = np.delete(M, 2, 0)
             self.stackedImage[:,:,i] = cv2.warpAffine(self.stackedImage[:,:,i], M, (w, h), borderMode=cv2.BORDER_REPLICATE)

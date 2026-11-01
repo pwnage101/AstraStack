@@ -20,6 +20,7 @@ from Stack import Stack, transform
 from Process import Process
 from Globals import *
 from WorkerPools import FRAME_POOL
+import ColorSpace
 from deconvolution import *
 
 from gi import require_version
@@ -287,7 +288,7 @@ class UI:
         thread.start()
         
     # Sets the number of threads to use
-    def setThreads(self, *args):
+    def setThreads(self, *args) -> None:
         g.nThreads = int(self.cpus.get_value())
         self.preferences.set("cpus", g.nThreads)
         # The next job creates a pool of the new size
@@ -346,6 +347,20 @@ class UI:
         Z = GLib.Bytes.new(z)
         height, width = img.shape[:2]
         return GdkPixbuf.Pixbuf.new_from_bytes(Z, GdkPixbuf.Colorspace.RGB, False, 8, width, height, width*3)
+
+    def createDisplayPixbuf(self,
+                            img: np.ndarray,
+                            workingSpace: ColorSpace.WorkingSpace | None) -> GdkPixbuf.Pixbuf:
+        """Returns a new GdkPixbuf showing linear working data as display-referred sRGB.
+
+        Args:
+            img: Linear 0-1 RGB image.
+            workingSpace: The working data's colors.
+
+        Returns:
+            The pixbuf.
+        """
+        return self.createPixbuf(ColorSpace.displayImage(img=img, workingSpace=workingSpace))
     
     def updatePreview(self, dialog: Gtk.FileChooser) -> None:
         """Shows a thumbnail of the file selected in the file chooser, or hides the preview.
@@ -359,10 +374,11 @@ class UI:
             try:
                 source = FrameSource.open(path)
                 try:
-                    img = Video(source).thumbnail()
+                    video = Video(source)
+                    img = video.thumbnail()
                 finally:
                     source.close()
-                pixbuf = self.createPixbuf(cv2.cvtColor(img*255, cv2.COLOR_BGR2RGB).astype('uint8'))
+                pixbuf = self.createDisplayPixbuf(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), video.workingSpace)
             except Exception:
                 pass
         if(pixbuf is not None):
@@ -465,9 +481,8 @@ class UI:
             self.builder.get_object("processTab").set_sensitive(True)
             self.tabs.set_current_page(UI.PROCESS_TAB)
 
-            img = cv2.cvtColor(self.video.getFrame(index=0, colorMode=g.actualColor())*255,
-                               cv2.COLOR_BGR2RGB).astype('uint8')
-            pixbuf = self.createPixbuf(img)
+            img = cv2.cvtColor(self.video.getFrame(index=0, colorMode=g.actualColor()), cv2.COLOR_BGR2RGB)
+            pixbuf = self.createDisplayPixbuf(img, self.video.workingSpace)
             self.frame.set_from_pixbuf(pixbuf.copy())
         except MemoryError:
             pass
@@ -502,20 +517,24 @@ class UI:
             response = self.saveDialog.run()
             if(response == Gtk.ResponseType.OK):
                 fileName = self.saveDialog.get_filename()
+                bitDepth = self.bitDepth.get_active_text()
+                if(not fileName.lower().endswith(ColorSpace.SAVE_EXTENSIONS)):
+                    self.showErrorDialog("Only .png, .jpg/.jpeg and .tif/.tiff files are supported")
+                    start()
+                    return
+                if(bitDepth == "16-bit" and fileName.lower().endswith((".jpg", ".jpeg"))):
+                    self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
+                    start()
+                    return
                 try:
                     while(self.processThread != None and self.processThread.is_alive()):
                         time.sleep(0.1) # Make sure the file isn't still being processed
-                    bitDepth = self.bitDepth.get_active_text()
-                    if(bitDepth == "8-bit"):
-                        cv2.imwrite(fileName, cv2.cvtColor(np.around(self.process.finalImage*255).astype('uint8'), cv2.COLOR_RGB2BGR))
-                    elif(bitDepth == "16-bit"):
-                        if(fileName.endswith(".png") or fileName.endswith(".tif") or fileName.endswith(".tiff")):
-                            cv2.imwrite(fileName, cv2.cvtColor(np.around(self.process.finalImage*65535).astype('uint16'), cv2.COLOR_RGB2BGR))
-                        else:
-                            self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
-                            start()
-                except: # Save Failed
-                    self.showErrorDialog("There was an error saving the image, make sure it is a valid file extension.")
+                    ColorSpace.saveSRGB(file=fileName,
+                                        img=self.process.finalImage,
+                                        workingSpace=g.actualWorkingSpace(),
+                                        bits=16 if bitDepth == "16-bit" else 8)
+                except Exception: # Save Failed
+                    self.showErrorDialog("There was an error saving the image.")
         start()
         self.saveDialog.hide()
         
@@ -552,6 +571,8 @@ class UI:
                     "Not all images were added to the stack.  "
                     "Make sure they are all the same dimensions."
                 )
+            if(self.video.descriptionMismatch):
+                self.showErrorDialog("Not all images have the same color tags.  Every image is decoded like the first one.")
             self.window.set_title(self.sourceTitle() + " - " + UI.TITLE)
             self.saveDialog.set_current_name("")
 
@@ -649,6 +670,8 @@ class UI:
                 videoIndex = min(videoIndex, len(self.video.frames)-1)
                 img = cv2.cvtColor(self.video.getFrame(self.video.frames[videoIndex], g.actualColor()),
                                    cv2.COLOR_BGR2RGB)
+            # The alignment previews below work on display values, like alignment does
+            img = ColorSpace.displayEncode(img=img, workingSpace=self.video.workingSpace)
                 
             height, width = img.shape[:2]
             
@@ -681,7 +704,7 @@ class UI:
                     C[1][2] = -C[1][2]
                 img = cv2.warpAffine(img, C, (width, height), flags=cv2.INTER_NEAREST)
 
-            pixbuf = self.createPixbuf((img*255).astype(np.uint8))
+            pixbuf = self.createPixbuf(ColorSpace.quantize(img))
             self.frame.set_from_pixbuf(pixbuf.copy())
         elif(page_num == UI.STACK_TAB and self.stack is not None):
             if(int(self.frameSlider.get_value()) >= len(self.stack.tmats)):
@@ -689,15 +712,15 @@ class UI:
             tmat = self.stack.tmats[int(self.frameSlider.get_value())]
             videoIndex = tmat[0]
             M = tmat[1]
-            img = (self.video.getFrame(videoIndex, g.actualColor())*255).astype(np.uint8)
+            img = self.video.getFrame(videoIndex, g.actualColor())
             if(g.autoCrop):
-                ref = (self.stack.refBG*255).astype(np.uint8)
+                ref = self.stack.refBG
             else:
                 ref = None
             img = transform(img, ref, M, self.align.minX, self.align.maxX, self.align.minY, self.align.maxY, g)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            pixbuf = self.createPixbuf(img)
+            pixbuf = self.createDisplayPixbuf(img, self.video.workingSpace)
             self.frame.set_from_pixbuf(pixbuf.copy())
             self.updateQualityImage()
             
@@ -887,7 +910,7 @@ class UI:
         self.psfImage.set_from_pixbuf(pixbuf.copy())
     
     # Updates the RGB histogram of the final image    
-    def updateHistogram(self):
+    def updateHistogram(self) -> None:
         allocation = self.builder.get_object("processTab").get_allocation()
         width = max(250, allocation.width-1)
         padding = 5
@@ -895,8 +918,9 @@ class UI:
         bins = np.arange(256).reshape(256, 1)
         
         color = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+        displayed = ColorSpace.displayImage(img=self.process.finalImage, workingSpace=g.actualWorkingSpace())
         for i, col in enumerate(color):
-            hist = np.log(cv2.calcHist([np.around(self.process.finalImage*255).astype('uint8')],[i],None,[256],[0,256]) + 1)
+            hist = np.log(cv2.calcHist([displayed],[i],None,[256],[0,256]) + 1)
             cv2.normalize(hist, hist, 0, 99, cv2.NORM_MINMAX)
             hist = 99 - hist
             hist = np.int32(np.around(hist))
@@ -1337,12 +1361,13 @@ class UI:
         self.updatePSFImage(args)
     
     # Called when processing is complete
-    def finishedProcessing(self, *args):
+    def finishedProcessing(self, *args) -> None:
         def update():
             if(self.showMask.get_active() and self.process.thresh is not None):
-                pixbuf = self.createPixbuf(np.around(self.process.thresh*255).astype('uint8'))
+                # The mask isn't light, so it is shown as it is
+                pixbuf = self.createPixbuf(ColorSpace.quantize(self.process.thresh))
             else:
-                pixbuf = self.createPixbuf(np.around(self.process.finalImage*255).astype('uint8'))
+                pixbuf = self.createDisplayPixbuf(self.process.finalImage, g.actualWorkingSpace())
             self.frame.set_from_pixbuf(pixbuf.copy())
             self.updateHistogram()
             self.processSpinner.stop()
