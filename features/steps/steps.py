@@ -4,6 +4,8 @@ import sys
 from behave import *
 from behave.runner import Context
 import time
+import struct
+import zlib
 import cv2
 import numpy as np
 from threading import Thread
@@ -15,6 +17,9 @@ sys.path.insert(0, os.getcwd())
 
 from UI import UI
 from Globals import g
+from Video import Video
+from FrameSource import ImageSequenceSource
+import ColorSpace
 
 tabMap = {"Load": UI.LOAD_TAB,
           "Align": UI.ALIGN_TAB,
@@ -335,3 +340,183 @@ def compareOutputToReference(context: Context, outputFile: str, referenceFile: s
         os.path.join(context.testOutputs, outputFile),
         os.path.join(TEST_REFERENCES_PATH, referenceFile),
     )
+
+def assertLinearEqual(file1: str, file2: str, maxDiff: float) -> None:
+    """Asserts that two image files decode to the same linear values, compared as display-encoded sRGB.
+
+    Each file is read through its own color tags, so an untagged linear input and its tagged sRGB output can match.
+
+    Args:
+        file1: Path of the first image.
+        file2: Path of the second image.
+        maxDiff: Largest allowed difference of the sRGB-encoded values, in 8-bit steps.
+    """
+    encoded = []
+    for file in (file1, file2):
+        video = Video(ImageSequenceSource(file))
+        linear = cv2.cvtColor(video.getFrame(index=0, colorMode=Video.COLOR_RGB), cv2.COLOR_BGR2RGB)
+        encoded.append(ColorSpace.displayEncode(img=linear, workingSpace=video.workingSpace))
+    assert encoded[0].shape == encoded[1].shape, f"'{file1}' and '{file2}' differ in shape"
+    diff = np.abs(encoded[0] - encoded[1]).max()*255
+    assert diff <= maxDiff, f"'{file1}' and '{file2}' differ by up to {diff:.3f} 8-bit steps"
+
+@then(u'output "{outputFile}" and input "{inputFile}" should decode to the same linear values')
+def compareLinearOutputToInput(context: Context, outputFile: str, inputFile: str) -> None:
+    """Asserts that an output file decodes to the same linear values as a file in ``TEST_INPUTS_PATH``."""
+    assertLinearEqual(
+        file1=os.path.join(context.testOutputs, outputFile),
+        file2=os.path.join(TEST_INPUTS_PATH, inputFile),
+        maxDiff=1,
+    )
+
+@given(u'I choose saved file "{file}" from "{dialog}"')
+def chooseSavedFile(context: Context, file: str, dialog: str) -> None:
+    chooseFile(path=os.path.join(context.testOutputs, file), dialog=dialog)
+
+@step(u'I cancel "{dialog}"')
+def cancelDialog(context: Context, dialog: str) -> None:
+    window = g.ui.builder.get_object(dialog)
+    while(not window.is_visible()):
+        delay(0.01)
+    delay()
+    def update():
+        window.response(Gtk.ResponseType.CANCEL)
+    idle_add_delay(update)
+    while(window.is_visible()):
+        delay(0.01)
+
+@then(u'the error dialog should show "{text}"')
+def errorDialogShows(context: Context, text: str) -> None:
+    """Asserts that the error dialog is shown with a message containing the text, then closes it."""
+    dialog = g.ui.builder.get_object("errorDialog")
+    deadline = time.monotonic() + WIDGET_TIMEOUT
+    while(not dialog.is_visible() and time.monotonic() < deadline):
+        delay(0.05)
+    assert dialog.is_visible(), "The error dialog is not shown"
+    delay()
+    message = []
+    def update():
+        message.append(dialog.get_property("secondary-text"))
+        dialog.response(Gtk.ResponseType.OK)
+    idle_add_delay(update)
+    assert text in message[0], f"The error dialog shows '{message[0]}'"
+
+@then(u'output "{file1}" and output "{file2}" should be equal within "{maxDiff}"')
+def compareOutputs(context: Context, file1: str, file2: str, maxDiff: str) -> None:
+    """Asserts that two output files have the same shape and pixels within a tolerance."""
+    img1 = cv2.imread(os.path.join(context.testOutputs, file1), cv2.IMREAD_UNCHANGED)
+    img2 = cv2.imread(os.path.join(context.testOutputs, file2), cv2.IMREAD_UNCHANGED)
+    assert img1 is not None and img2 is not None, f"'{file1}' or '{file2}' could not be read"
+    assert img1.shape == img2.shape, f"'{file1}' {img1.shape} and '{file2}' {img2.shape} differ in shape"
+    diff = cv2.absdiff(img1, img2).max()
+    assert diff <= float(maxDiff), f"'{file1}' and '{file2}' differ by up to {diff}"
+
+@then(u'output "{file1}" and output "{file2}" should be equal within "{maxMean}" on average')
+def compareOutputsOnAverage(context: Context, file1: str, file2: str, maxMean: str) -> None:
+    """Asserts that two output files have the same shape and a mean absolute difference within a tolerance."""
+    img1 = cv2.imread(os.path.join(context.testOutputs, file1), cv2.IMREAD_UNCHANGED)
+    img2 = cv2.imread(os.path.join(context.testOutputs, file2), cv2.IMREAD_UNCHANGED)
+    assert img1.shape == img2.shape, f"'{file1}' {img1.shape} and '{file2}' {img2.shape} differ in shape"
+    mean = cv2.absdiff(img1, img2).mean()
+    assert mean <= float(maxMean), f"'{file1}' and '{file2}' differ by {mean:.2f} on average"
+
+@then(u'output "{file1}" and output "{file2}" should differ')
+def outputsDiffer(context: Context, file1: str, file2: str) -> None:
+    img1 = cv2.imread(os.path.join(context.testOutputs, file1), cv2.IMREAD_UNCHANGED)
+    img2 = cv2.imread(os.path.join(context.testOutputs, file2), cv2.IMREAD_UNCHANGED)
+    assert img1.shape != img2.shape or cv2.absdiff(img1, img2).max() > 8, f"'{file1}' and '{file2}' are equal"
+
+@then(u'output "{file}" at "{x},{y}" should be about "{r},{g},{b}" within "{tolerance}"')
+def outputPixel(context: Context, file: str, x: str, y: str, r: str, g: str, b: str, tolerance: str) -> None:
+    """Asserts the 8-bit RGB value of an output pixel."""
+    img = cv2.imread(os.path.join(context.testOutputs, file))
+    pixel = img[int(y), int(x)][::-1].astype(int)
+    expected = np.array([int(r), int(g), int(b)])
+    assert np.abs(pixel - expected).max() <= int(tolerance), f"'{file}' at {x},{y} is {pixel.tolist()}"
+
+@then(u'output "{file}" should not exist')
+def outputMissing(context: Context, file: str) -> None:
+    assert not os.path.exists(os.path.join(context.testOutputs, file)), f"'{file}' was written"
+
+def isSRGBProfile(icc: bytes | None) -> bool:
+    """Returns whether an ICC profile describes sRGB.
+
+    Args:
+        icc: The profile bytes, or None.
+
+    Returns:
+        True for a matrix/TRC profile with sRGB primaries and the sRGB curve.
+    """
+    if(not icc or not ColorSpace.isMatrixProfile(icc)):
+        return False
+    params, workingSpace = ColorSpace.fromICC(icc)
+    return params.transfer == ("sRGB", None) and workingSpace is ColorSpace.SRGB
+
+@then(u'output "{file}" should be tagged as sRGB')
+def outputTaggedSRGB(context: Context, file: str) -> None:
+    """Asserts that a saved PNG has exactly the sRGB chunks, or that a JPEG/TIFF carries an sRGB profile."""
+    path = os.path.join(context.testOutputs, file)
+    if(file.endswith(".png")):
+        chunks = ColorSpace.pngChunks(path)
+        colorChunks = [(kind, data) for kind, data in chunks if kind in (b"cICP", b"iCCP", b"sRGB", b"gAMA", b"cHRM")]
+        kinds = [kind for kind, data in colorChunks]
+        assert kinds == [b"cICP", b"iCCP", b"sRGB", b"gAMA"], f"'{file}' has {kinds}"
+        chunks = dict(colorChunks)
+        assert chunks[b"cICP"] == bytes([1, 13, 0, 1]), f"'{file}' has cICP {list(chunks[b'cICP'])}"
+        assert chunks[b"sRGB"] == bytes([0]), f"'{file}' has sRGB {list(chunks[b'sRGB'])}"
+        assert chunks[b"gAMA"] == struct.pack(">I", 45455), f"'{file}' has gAMA {chunks[b'gAMA']}"
+        name, icc = chunks[b"iCCP"].split(b"\0", 1)
+        assert name == b"sRGB", f"'{file}' has iCCP profile name {name}"
+        assert isSRGBProfile(zlib.decompress(icc[1:])), f"'{file}' has an iCCP profile that isn't sRGB"
+    else:
+        assert isSRGBProfile(ColorSpace.readICC(path)), f"'{file}' doesn't carry an sRGB profile"
+
+@then(u'output "{file}" should have "{bits}" bits')
+def outputBits(context: Context, file: str, bits: str) -> None:
+    img = cv2.imread(os.path.join(context.testOutputs, file), cv2.IMREAD_UNCHANGED)
+    assert img.dtype == (np.uint16 if bits == "16" else np.uint8), f"'{file}' is {img.dtype}"
+
+@then(u'the loaded file should be tagged as sRGB')
+def loadedSRGB(context: Context) -> None:
+    assert g.decodeParams.transfer == ("sRGB", None), f"The transfer is {g.decodeParams.transfer}"
+    assert g.workingSpace == ColorSpace.SRGB, "The working space isn't sRGB"
+
+def regionMean(context: Context, file: str, region: str) -> np.ndarray:
+    """Returns the mean linear sRGB value of a region of an output file.
+
+    Args:
+        context: The behave context.
+        file: The output file.
+        region: "x1,y1,x2,y2".
+
+    Returns:
+        The mean linear RGB value.
+    """
+    x1, y1, x2, y2 = [int(v) for v in region.split(",")]
+    video = Video(ImageSequenceSource(os.path.join(context.testOutputs, file)))
+    linear = cv2.cvtColor(video.getFrame(index=0, colorMode=Video.COLOR_RGB), cv2.COLOR_BGR2RGB)
+    return linear[y1:y2, x1:x2].reshape(-1, 3).mean(axis=0)
+
+@then(u'output "{file}" in region "{region}" should have the camera ratios "{r},{g},{b}" of "{rawFile}" within "{tolerance}"')
+def outputCameraRatios(context: Context,
+                       file: str,
+                       region: str,
+                       r: str,
+                       g: str,
+                       b: str,
+                       rawFile: str,
+                       tolerance: str) -> None:
+    """Asserts the ratios to green of a region of an output, converted back from sRGB to the RAW file's camera RGB."""
+    import rawpy
+    with rawpy.imread(os.path.join(TEST_INPUTS_PATH, rawFile)) as raw:
+        rgbCam = ColorSpace.rawRGBCam(raw)
+    camera = np.linalg.solve(rgbCam, regionMean(context=context, file=file, region=region))
+    ratios = camera/camera[1]
+    expected = np.array([float(r), float(g), float(b)])
+    assert np.abs(ratios/expected - 1).max() <= float(tolerance), f"The camera ratios are {ratios.round(3).tolist()}"
+
+@then(u'output "{file}" in region "{region}" should be neutral within "{tolerance}"')
+def outputNeutral(context: Context, file: str, region: str, tolerance: str) -> None:
+    mean = regionMean(context=context, file=file, region=region)
+    ratios = mean/mean[1]
+    assert np.abs(ratios - 1).max() <= float(tolerance), f"The ratios to green are {ratios.round(3).tolist()}"

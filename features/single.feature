@@ -7,7 +7,7 @@ Feature: Single Image
         And I wait until active tab is "Process"
         And I async press "saveButton"
         And I choose output file "test_unchanged.png" from "saveDialog"
-        Then output "test_unchanged.png" and input "test.jpg" should be equal
+        Then output "test_unchanged.png" and input "test.jpg" should decode to the same linear values
   
     Scenario: Test processing single image
         Given I am on tab "Load"
@@ -57,7 +57,7 @@ Feature: Single Image
         And I async press "saveButton"
         And I select "16-bit" from "bitDepth"
         And I choose output file "16bit_unchanged.png" from "saveDialog"
-        Then output "16bit_unchanged.png" and input "16bit.png" should be equal
+        Then output "16bit_unchanged.png" and input "16bit.png" should decode to the same linear values
         
     Scenario: Test masking stretched image
         Given I am on tab "Load"

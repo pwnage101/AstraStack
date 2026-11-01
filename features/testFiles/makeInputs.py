@@ -480,6 +480,16 @@ def writeSequenceVideos() -> None:
                os.path.join(COLOR_DIR, f"{kind}.avi"))
 
 
+def writeMismatchedSequence() -> None:
+    """Writes a two-frame sequence whose frames have different color tags: untagged, then with an sRGB chunk."""
+    folder = os.path.join(COLOR_DIR, "mismatched_sequence")
+    os.makedirs(folder, exist_ok=True)
+    frames = [to8(cropAndHalve(frame)/65535) for frame in decodeFrames(2)]
+    with open(os.path.join(folder, "frame_000.png"), "wb") as f:
+        f.write(encodePNG(frames[0]))
+    writePNG(path=os.path.join(folder, "frame_001.png"), img=frames[1], chunks=[(b"sRGB", bytes([0]))])
+
+
 def writeVideos() -> None:
     """Writes the re-tagged, range and untagged RGB/gray videos."""
     retagVideo(name="bt709.mp4", primaries=1, transfer=1, matrix=1)
@@ -488,6 +498,7 @@ def writeVideos() -> None:
     retagVideo(name="bt709_unspecified_trc.mp4", primaries=1, transfer=2, matrix=1)
     writeRangeVideos()
     writeSequenceVideos()
+    writeMismatchedSequence()
 
 
 def writeFITS(linear: np.ndarray) -> None:

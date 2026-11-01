@@ -519,10 +519,12 @@ class UI:
                 fileName = self.saveDialog.get_filename()
                 bitDepth = self.bitDepth.get_active_text()
                 if(not fileName.lower().endswith(ColorSpace.SAVE_EXTENSIONS)):
+                    self.saveDialog.hide()
                     self.showErrorDialog("Only .png, .jpg/.jpeg and .tif/.tiff files are supported")
                     start()
                     return
                 if(bitDepth == "16-bit" and fileName.lower().endswith((".jpg", ".jpeg"))):
+                    self.saveDialog.hide()
                     self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
                     start()
                     return
