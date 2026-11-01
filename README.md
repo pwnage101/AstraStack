@@ -86,6 +86,11 @@ using parallel headless mode and is about 2-3x faster than bare `behave`:
 scripts/run_behave.sh
 ```
 
+## Third-Party Notices
+
+- [colour-science](https://www.colour-science.org/) is distributed under the BSD-3-Clause license.
+- The [PyAV](https://pyav.basswood-io.com/) wheels bundle [FFmpeg](https://ffmpeg.org/), distributed under the LGPL.
+
 # References
 1. RegiStax - https://www.astronomie.be/registax/
 1. PyStackReg - https://pypi.org/project/pystackreg/
