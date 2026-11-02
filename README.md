@@ -92,6 +92,13 @@ using parallel headless mode and is about 2-3x faster than bare `behave`:
 scripts/run_behave.sh
 ```
 
+On macOS, GTK must run on the main thread, so run the suite through a launcher
+that takes the same arguments as `behave`:
+
+```
+python scripts/run_behave_main_thread.py
+```
+
 # References
 1. RegiStax - https://www.astronomie.be/registax/
 1. PyStackReg - https://pypi.org/project/pystackreg/
