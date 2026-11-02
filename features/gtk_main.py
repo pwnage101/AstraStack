@@ -15,6 +15,10 @@ from gi.repository import Gtk
 _tasks: "queue.Queue[Callable[[], None]]" = queue.Queue()
 _serving = False
 
+def isServing() -> bool:
+    """Returns whether serve() has handed the main thread to GTK."""
+    return _serving
+
 def start(task: Callable[[], None]) -> Event:
     """Runs a task that builds the UI and then runs the GTK main loop.
 

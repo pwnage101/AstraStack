@@ -28,6 +28,8 @@ def before_all(context: Context) -> None:
     else:
         context.testOutputs = tempfile.mkdtemp(prefix="astrastack-test-")
     context.scenarioIndex = count()
+    if(sys.platform == "darwin" and not gtk_main.isServing()):
+        raise RuntimeError("On macOS, run the suite with `python scripts/run_behave_main_thread.py` instead of `behave`")
 
 def before_feature(context: Context, feature: Feature) -> None:
     for scenario in feature.walk_scenarios():
