@@ -69,25 +69,44 @@ class Video:
                                       output_bps=16)
                 params, workingSpace = ColorSpace.fromRAW(raw)
             return (cv2.cvtColor(img, cv2.COLOR_RGB2BGR), params, workingSpace)
-        img = cv2.imread(file, cv2.IMREAD_UNCHANGED)
+        # Any depth and channel count, without alpha and with the EXIF orientation applied
+        img = cv2.imread(file, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
         if(img is not None):
-            if(len(img.shape) == 3 and img.shape[2] == 4):
-                img = img[:, :, :3]
             params, workingSpace = ColorSpace.describeImage(file, channels=1 if len(img.shape) == 2 else 3)
-            return (img, params, workingSpace)
+            return (Video.toSupportedDtype(img), params, workingSpace)
         # Image might be a FITS image so give that a try
         from astropy.io import fits
         with fits.open(file) as hdus:
             hdu = next(hdu for hdu in hdus if hdu.data is not None)
+            # astropy returns big-endian data, which OpenCV and the lookup tables would misread
             img = np.asarray(hdu.data)
+            img = img.astype(img.dtype.newbyteorder("="))
             header = hdu.header
             if(img.ndim == 3):
                 # Color planes (RGB) first
-                img = cv2.cvtColor(np.ascontiguousarray(np.moveaxis(img[:3], 0, -1)), cv2.COLOR_RGB2BGR)
+                img = np.ascontiguousarray(np.moveaxis(img[:3], 0, -1)[:, :, ::-1])
             params = ColorSpace.fromFITS(header=header, data=img)
         if(img.dtype not in (np.uint8, np.uint16)):
             img = img.astype(np.float32)
         return (img, params, ColorSpace.UNTAGGED)
+
+    @staticmethod
+    def toSupportedDtype(img: np.ndarray) -> np.ndarray:
+        """Returns image data as uint8, uint16 or float32, the types the pipeline handles.
+
+        Other integer types are scaled from their maximum to 0-1 floats; floats are taken as 0-1 already.
+
+        Args:
+            img: The image as read.
+
+        Returns:
+            The image as uint8, uint16 or float32.
+        """
+        if(img.dtype in (np.uint8, np.uint16)):
+            return img
+        if(np.issubdtype(img.dtype, np.integer)):
+            return (img.astype(np.float64)/np.iinfo(img.dtype).max).astype(np.float32)
+        return img.astype(np.float32)
 
     # Checks to see if there will be enough memory to process the image
     def checkMemory(self) -> None:
@@ -216,7 +235,10 @@ class Video:
         if(colorMode >= Video.COLOR_RGGB and image.dtype == np.uint16 and self.source.recordedBits() == 8):
             # Demosaic 8-bit video as 8-bit (VNG only works on uint8)
             image = np.around(image/257).astype(np.uint8)
-        image, params, workingSpace = Video.applyColorMode(image, colorMode, params, workingSpace)
+        image, params, workingSpace = Video.applyColorMode(image=image,
+                                                           colorMode=colorMode,
+                                                           params=params,
+                                                           workingSpace=workingSpace)
         self.decodeParams = params
         self.workingSpace = workingSpace
         return ColorSpace.linearize(img=image, params=params, bgr=True)
@@ -245,9 +267,9 @@ class Video:
         if(colorMode < Video.COLOR_RGGB):
             return (Video._applyColorMode(img=image, colorMode=colorMode), params, workingSpace)
         if(params.whiteLevel is None):
-            params = ColorSpace.DecodeParams(blackLevel=(0.0, 0.0, 0.0),
-                                             whiteLevel=float(np.iinfo(image.dtype).max))
-        elif(image.dtype not in (np.uint8, np.uint16)):
+            white = float(np.iinfo(image.dtype).max) if np.issubdtype(image.dtype, np.integer) else 1.0
+            params = ColorSpace.DecodeParams(blackLevel=(0.0, 0.0, 0.0), whiteLevel=white)
+        if(image.dtype not in (np.uint8, np.uint16)):
             # OpenCV only demosaics integers
             scale = 65535/params.whiteLevel
             image = np.around(np.clip(image*scale, 0, 65535)).astype(np.uint16)

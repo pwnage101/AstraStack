@@ -288,7 +288,7 @@ class UI:
         thread.start()
         
     # Sets the number of threads to use
-    def setThreads(self, *args) -> None:
+    def setThreads(self, *args: object) -> None:
         g.nThreads = int(self.cpus.get_value())
         self.preferences.set("cpus", g.nThreads)
         # The next job creates a pool of the new size
@@ -517,13 +517,13 @@ class UI:
             response = self.saveDialog.run()
             if(response == Gtk.ResponseType.OK):
                 fileName = self.saveDialog.get_filename()
-                bitDepth = self.bitDepth.get_active_text()
+                bits = 16 if self.bitDepth.get_active_id() == "1" else 8
                 if(not fileName.lower().endswith(ColorSpace.SAVE_EXTENSIONS)):
                     self.saveDialog.hide()
                     self.showErrorDialog("Only .png, .jpg/.jpeg and .tif/.tiff files are supported")
                     start()
                     return
-                if(bitDepth == "16-bit" and fileName.lower().endswith((".jpg", ".jpeg"))):
+                if(bits == 16 and fileName.lower().endswith((".jpg", ".jpeg"))):
                     self.saveDialog.hide()
                     self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
                     start()
@@ -534,8 +534,9 @@ class UI:
                     ColorSpace.saveSRGB(file=fileName,
                                         img=self.process.finalImage,
                                         workingSpace=g.actualWorkingSpace(),
-                                        bits=16 if bitDepth == "16-bit" else 8)
-                except Exception: # Save Failed
+                                        bits=bits)
+                except Exception as error: # Save Failed
+                    print(error)
                     self.showErrorDialog("There was an error saving the image.")
         start()
         self.saveDialog.hide()
@@ -574,7 +575,8 @@ class UI:
                     "Make sure they are all the same dimensions."
                 )
             if(self.video.descriptionMismatch):
-                self.showErrorDialog("Not all images have the same color tags.  Every image is decoded like the first one.")
+                self.showErrorDialog("Not all images have the same color tags.  "
+                                     "Every image is decoded like the first one.")
             self.window.set_title(self.sourceTitle() + " - " + UI.TITLE)
             self.saveDialog.set_current_name("")
 

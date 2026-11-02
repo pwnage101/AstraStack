@@ -594,8 +594,8 @@
                 <property name="active">0</property>
                 <property name="active-id">0</property>
                 <items>
-                  <item id="0" translatable="yes">8-bit</item>
-                  <item id="1" translatable="yes">16-bit</item>
+                  <item id="0" translatable="yes">8-bit sRGB</item>
+                  <item id="1" translatable="yes">16-bit sRGB</item>
                 </items>
               </object>
               <packing>

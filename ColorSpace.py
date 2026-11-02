@@ -156,9 +156,9 @@ def bradford(src: np.ndarray | tuple, dst: np.ndarray | tuple) -> np.ndarray:
     Returns:
         The 3×3 matrix converting XYZ under src to XYZ under dst.
     """
-    return colour.adaptation.matrix_chromatic_adaptation_VonKries(np.asarray(src, dtype=np.float64),
-                                                                    np.asarray(dst, dtype=np.float64),
-                                                                    "Bradford")
+    return colour.adaptation.matrix_chromatic_adaptation_VonKries(XYZ_w=np.asarray(src, dtype=np.float64),
+                                                                    XYZ_wr=np.asarray(dst, dtype=np.float64),
+                                                                    transform="Bradford")
 
 
 def toD65(toXYZ: np.ndarray, white: np.ndarray | tuple) -> WorkingSpace:
@@ -239,7 +239,7 @@ def transferToLinear(x: np.ndarray, transfer: Transfer | None, bgr: bool = False
     elif(name == "PQ"):
         y = colour.models.eotf_ST2084(np.maximum(x, 0))/params
     elif(name == "Gamma"):
-        y = colour.gamma_function(x, params, "Mirror")
+        y = colour.gamma_function(a=x, exponent=params, negative_number_handling="Mirror")
     elif(name == "ICC"):
         curves = params[::-1] if bgr else params
         y = np.stack([curveToLinear(curve=curve, x=x[..., i]) for i, curve in enumerate(curves)], axis=-1)
@@ -276,7 +276,7 @@ def linearToTransfer(y: np.ndarray, transfer: Transfer | None) -> np.ndarray:
     elif(name == "PQ"):
         x = colour.models.eotf_inverse_ST2084(np.maximum(y, 0)*params)
     elif(name == "Gamma"):
-        x = colour.gamma_function(y, 1/params, "Mirror")
+        x = colour.gamma_function(a=y, exponent=1/params, negative_number_handling="Mirror")
     else:
         raise ValueError("Can't encode with transfer function " + repr(name))
     return np.asarray(x).astype(dtype)
@@ -437,7 +437,7 @@ def curveToLinear(curve: IccCurve, x: np.ndarray) -> np.ndarray:
         The linear values.
     """
     if(curve[0] == "gamma"):
-        return colour.gamma_function(x, curve[1], "Mirror")
+        return colour.gamma_function(a=x, exponent=curve[1], negative_number_handling="Mirror")
     elif(curve[0] == "table"):
         table = np.array(curve[1], dtype=np.float64)/65535
         return np.interp(x, np.linspace(0, 1, len(table)), table)
@@ -664,7 +664,9 @@ def applyLUT(img: np.ndarray, transform: ImageCms.ImageCmsTransform, bgr: bool =
     Returns:
         The converted uint8 image, in the same channel order.
     """
-    if(img.dtype != np.uint8):
+    if(np.issubdtype(img.dtype, np.floating)):
+        img = np.around(np.clip(img, 0, 1)*255).astype(np.uint8)
+    elif(img.dtype != np.uint8):
         img = np.around(img.astype(np.float32)/np.iinfo(img.dtype).max*255).astype(np.uint8)
     rgb = img[:, :, ::-1] if bgr else img
     out = np.asarray(ImageCms.applyTransform(Image.fromarray(np.ascontiguousarray(rgb), "RGB"), transform))
@@ -1120,7 +1122,7 @@ def saveSRGB(file: str, img: np.ndarray, workingSpace: WorkingSpace | None, bits
             f.write(insertPNGChunks(png=png.tobytes(), chunks=srgbPNGChunks()))
     elif(extension in (".tif", ".tiff") and bits == 16):
         tifffile = lazy("tifffile")
-        tifffile.imwrite(file, rgb, photometric="rgb", iccprofile=srgbProfile())
+        tifffile.imwrite(file, data=rgb, photometric="rgb", iccprofile=srgbProfile())
     elif(extension in (".tif", ".tiff")):
         Image.fromarray(rgb, "RGB").save(file, icc_profile=srgbProfile())
     else:

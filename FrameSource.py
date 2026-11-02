@@ -266,8 +266,8 @@ class VideoSource(FrameSource):
         formatName = ""
         isYUV = True
         if(codec.format is not None):
-            self.videoBits = codec.format.components[0].bits
             formatName = codec.format.name
+            self.videoBits = VideoSource.formatBits(codec.format)
             isYUV = not codec.format.is_rgb and len(codec.format.components) >= 3
         self.params, self.workingSpace = ColorSpace.fromVideoTags(primaries=codec.color_primaries,
                                                                   transfer=codec.color_trc,
@@ -278,6 +278,21 @@ class VideoSource(FrameSource):
         self.decoder = None
         self.lastTimestamp = None
         self.lastFrame = None
+
+    @staticmethod
+    def formatBits(videoFormat: av.VideoFormat) -> int:
+        """Returns the bit depth of a video pixel format.
+
+        Args:
+            videoFormat: The pixel format.
+
+        Returns:
+            The depth of one sample; Bayer formats, whose components report a pseudo-depth, use
+            their name.
+        """
+        if(videoFormat.name.startswith("bayer_")):
+            return 16 if "16" in videoFormat.name else 8
+        return videoFormat.components[0].bits
 
     def frameTimestamps(self) -> list[int]:
         """Returns the presentation timestamps of the frames, read from the packets the first time.
@@ -314,7 +329,7 @@ class VideoSource(FrameSource):
             The full range uint16 BGR image.
         """
         if(self.params.yuvMatrix is not None):
-            sourceBits = max(8, min(16, videoFrame.format.components[0].bits))
+            sourceBits = max(8, min(16, VideoSource.formatBits(videoFrame.format)))
             yuvFormat = "yuv444p" if sourceBits == 8 else "yuv444p" + str(sourceBits) + "le"
             yuvFrame = videoFrame.reformat(format=yuvFormat)
             dtype = np.uint8 if sourceBits == 8 else np.uint16
@@ -327,7 +342,7 @@ class VideoSource(FrameSource):
             image = ColorSpace.quantize(img=rgb, bits=16)
         else:
             # Converted at the source's bit depth and widened exactly, so untagged RGB/gray loads unchanged
-            sourceBits = 8 if videoFrame.format.components[0].bits <= 8 else 16
+            sourceBits = 8 if VideoSource.formatBits(videoFrame.format) <= 8 else 16
             image = videoFrame.reformat(format="rgb24" if sourceBits == 8 else "rgb48le").to_ndarray()
             if(sourceBits == 8):
                 image = image.astype(np.uint16)*257

@@ -176,7 +176,7 @@ Feature: Color
         And I choose input file "color/linear.png" from "openDialog"
         And I wait until active tab is "Process"
         And I async press "saveButton"
-        And I select "<bits>-bit" from "bitDepth"
+        And I select "<bits>-bit sRGB" from "bitDepth"
         And I choose output file "<file>" from "saveDialog"
         Then output "<file>" should be tagged as sRGB
         And output "<file>" should have "<bits>" bits
@@ -206,7 +206,7 @@ Feature: Color
         And I choose input file "color/linear.png" from "openDialog"
         And I wait until active tab is "Process"
         And I async press "saveButton"
-        And I select "16-bit" from "bitDepth"
+        And I select "16-bit sRGB" from "bitDepth"
         And I choose output file "reload.png" from "saveDialog"
         And I am on tab "Load"
         And I async press "openFile"

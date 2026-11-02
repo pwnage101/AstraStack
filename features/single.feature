@@ -55,7 +55,7 @@ Feature: Single Image
         And I choose input file "16bit.png" from "openDialog"
         And I wait until active tab is "Process"
         And I async press "saveButton"
-        And I select "16-bit" from "bitDepth"
+        And I select "16-bit sRGB" from "bitDepth"
         And I choose output file "16bit_unchanged.png" from "saveDialog"
         Then output "16bit_unchanged.png" and input "16bit.png" should decode to the same linear values
         

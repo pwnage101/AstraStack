@@ -8,8 +8,12 @@ class Object():
     def actualColor(self):
         return (self.colorMode or self.guessedColorMode)
 
-    # Returns the working space of the loaded file's working data, which has no primaries once demosaiced
     def actualWorkingSpace(self) -> "ColorSpace.WorkingSpace":
+        """Returns the working space of the loaded file's working data.
+
+        Returns:
+            The loaded file's working space, or one without primaries once the color mode demosaics.
+        """
         import ColorSpace
         from Video import Video
         if(self.actualColor() >= Video.COLOR_RGGB):
