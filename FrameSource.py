@@ -3,9 +3,17 @@ from lazy import lazy
 cv2 = lazy("cv2")
 np = lazy("numpy")
 rawpy = lazy("rawpy")
-import bisect
+av = lazy("av")
 from abc import ABC, abstractmethod
+from typing import NamedTuple
 from natsort import natsorted, ns
+import ColorSpace
+
+class Frame(NamedTuple):
+    """A frame as stored, and how to linearize it."""
+    image: np.ndarray
+    params: ColorSpace.DecodeParams
+    workingSpace: ColorSpace.WorkingSpace
 
 class FrameSource(ABC):
     """A sequence of frames stored in one or more files, addressed by integer index.
@@ -67,16 +75,16 @@ class FrameSource(ABC):
         """
 
     @abstractmethod
-    def readFrame(self, index: int) -> np.ndarray | None:
-        """Reads one frame as stored.
+    def readFrame(self, index: int) -> Frame | None:
+        """Reads one frame as stored, with its own description.
 
         Args:
             index: The frame's index.
 
         Returns:
             The frame in BGR order, or with a single channel for gray or Bayer mosaic frames,
-            at its stored depth (uint8 or uint16); or None if the source has no readable frame
-            at index.
+            at its stored depth (uint8 or uint16, or float32 for float FITS data); or None if
+            the source has no readable frame at index.
         """
 
     @abstractmethod
@@ -87,14 +95,34 @@ class FrameSource(ABC):
             The (width, height) of the first frame.
         """
 
-    def fastPreview(self) -> np.ndarray | None:
-        """Reads a display-ready preview of the first frame, if the file offers a quick way to.
+    def fastPreview(self) -> Frame | None:
+        """Reads a preview of the first frame, if the file offers a quick way to.
 
         Return None unless this is much quicker than reading the first frame; the caller then
         makes the preview from readFrame(0) itself.
 
         Returns:
-            The preview as uint8 BGR, possibly at a reduced size; or None.
+            The first frame like readFrame returns it, possibly at a reduced size; or None.
+        """
+        return None
+
+    def description(self) -> tuple[ColorSpace.DecodeParams, ColorSpace.WorkingSpace]:
+        """Returns how to linearize every frame of the source.
+
+        Every frame is linearized like the first one, so the images of a sequence that are
+        tagged differently are all decoded alike.
+
+        Returns:
+            The first frame's decode parameters and working space.
+        """
+        frame = self.readFrame(0)
+        return (frame.params, frame.workingSpace)
+
+    def recordedBits(self) -> int | None:
+        """Returns the bit depth the frames were recorded at, when readFrame widens them.
+
+        Returns:
+            The recorded depth, or None if frames are read at the depth they were recorded at.
         """
         return None
 
@@ -117,8 +145,8 @@ class ImageSequenceSource(FrameSource):
         """Accepts an image file, or a list of one or more image files.
 
         Each file must be recognized, without decoding its pixels, by one of the readers
-        readFrame decodes with, in its order: a raw camera file, an image format OpenCV reads,
-        then a FITS file with image data.
+        Video.decodeImage decodes with, in its order: a raw camera file, an image format OpenCV
+        reads, then a FITS file with image data.
         """
         paths = [path] if isinstance(path, str) else path
         for file in paths:
@@ -145,68 +173,38 @@ class ImageSequenceSource(FrameSource):
     def frameCount(self) -> int:
         return len(self.paths)
 
-    def readFrame(self, index: int) -> np.ndarray | None:
-        """Raw camera files are decoded and FITS files scaled to 16 bits."""
+    def readFrame(self, index: int) -> Frame | None:
+        """Each file is described by its own color tags."""
+        from Video import Video
         if(index >= len(self.paths)):
             return None
-        return ImageSequenceSource._readImageFile(self.paths[index])
+        return Frame(*Video.decodeImage(self.paths[index]))
 
-    @staticmethod
-    def _readImageFile(file: str) -> np.ndarray:
-        """Decodes an image file as a raw camera file, else an image OpenCV reads, else FITS.
-
-        Args:
-            file: The image file.
-
-        Returns:
-            The image. A raw camera image is demosaiced to 16-bit BGR, an image OpenCV reads
-            keeps its stored depth and channels, and a FITS image is stretched to the full
-            16-bit range.
-        """
-        try:
-            raw = rawpy.imread(file)
-        except Exception:
-            raw = None
-        if raw is not None:
-            with raw:
-                return cv2.cvtColor(raw.postprocess(output_bps=16), cv2.COLOR_RGB2BGR)
-        image = cv2.imread(file, cv2.IMREAD_UNCHANGED)
-        if image is not None:
-            return image
-        from astropy.io import fits
-
-        image = fits.getdata(file)
-        maxVal = np.iinfo(image.dtype).max if np.issubdtype(image.dtype, np.integer) else 1
-        maxOut = np.iinfo(np.uint16).max
-        image = (image.astype(np.float32) / maxVal) * maxOut
-        cv2.normalize(image, image, alpha=0, beta=maxOut, norm_type=cv2.NORM_MINMAX)
-        return image.astype(np.uint16)
-
-    def fastPreview(self) -> np.ndarray | None:
-        """A raw camera file is decoded at half size and 8 bits; other files have none."""
+    def fastPreview(self) -> Frame | None:
+        """A raw camera file is decoded at half size; other files have none."""
         # TODO: Read a raw camera file's embedded JPEG preview (rawpy's extract_thumb) instead,
         # falling back to the half size decode for files without one. It is far quicker, and it
         # keeps LibRaw's OpenMP code out of the main process.
+        from Video import Video
         try:
-            raw = rawpy.imread(self.paths[0])
+            rawpy.imread(self.paths[0]).close()
         except Exception:
+            # Not a raw camera file
             return None
-        with raw:
-            return cv2.cvtColor(
-                raw.postprocess(half_size=True, output_bps=8),
-                cv2.COLOR_RGB2BGR,
-            )
+        return Frame(*Video.decodeImage(file=self.paths[0],
+                                        thumbnail=True))
 
     def frameSize(self) -> tuple[int, int]:
-        height, width = self.readFrame(0).shape[:2]
+        height, width = self.readFrame(0).image.shape[:2]
         return (width, height)
 
 class VideoSource(FrameSource):
-    """A video file read with cv2.VideoCapture.
+    """A video file decoded with PyAV, described by its stream's color tags.
 
-    Frame indexes always represent unique frames in the data stream, and that's
-    all consumers should care about. Under the hood, we map each unique frame
-    to their time and later use that time for seeking to the frame.
+    Frames are indexed by their position in presentation order and found by seeking to their
+    timestamps. Reading a frame less than a second after the last one read decodes forward
+    instead of seeking. The timestamps are read from the video's packets, without decoding,
+    the first time they are needed, and pickled so worker processes don't read them again.
     """
 
     def __init__(self, path: str) -> None:
@@ -216,142 +214,162 @@ class VideoSource(FrameSource):
             path: The video file.
         """
         self.path = path
-        self.times: list[float] | None = None
-        self._capture: cv2.VideoCapture | None = None
-        self.nextPosition: int | None = 0
+        self.timestamps: list[int] | None = None
+        self.container: av.container.InputContainer | None = None
 
-    def __getstate__(self) -> dict[str, str | list[float] | None]:
-        """Only pickle things that are relevant to a new process.
+    def __getstate__(self) -> dict[str, str | list[int] | None]:
+        """Returns the state to pickle: the path and the timestamps, without the open container."""
+        return {"path": self.path, "timestamps": self.timestamps}
 
-        E.g. force new processes to open new file descriptors by *not* pickling self._capture.
+    def __setstate__(self, state: dict[str, str | list[int] | None]) -> None:
+        """Restores a pickled source, which opens its container when first read.
+
+        Args:
+            state: The state from __getstate__.
         """
-        return {"path": self.path, "times": self.times}
-
-    def __setstate__(self, state: dict[str, str | list[float] | None]) -> None:
-        """Restores a pickled source, which opens its capture when first read."""
         self.path = state["path"]
-        self.times = state["times"]
-        self._capture = None
-        self.nextPosition = 0
+        self.timestamps = state["timestamps"]
+        self.container = None
 
     @staticmethod
     def canOpen(path: str | list[str]) -> bool:
-        """Accepts a single file OpenCV opens and reads at least two frames from.
+        """Accepts a single file PyAV demuxes at least two video frames from.
 
         One-frame videos are rejected, and left to other FrameSource implementations to handle.
         """
         if(not isinstance(path, str)):
             return False
-        capture = cv2.VideoCapture(path)
         try:
-            return capture.isOpened() and capture.read()[0] and capture.grab()
-        finally:
-            capture.release()
+            with av.open(path) as container:
+                stream = container.streams.video[0]
+                packets = 0
+                for packet in container.demux(stream):
+                    packets += packet.size > 0
+                    if(packets >= 2):
+                        return True
+        except Exception:
+            pass
+        return False
 
     def filePaths(self) -> list[str]:
         return [self.path]
 
-    @property
-    def capture(self) -> cv2.VideoCapture:
-        """The capture, opened at the first frame if it isn't open."""
-        if(self._capture is None):
-            self._capture = cv2.VideoCapture(self.path)
-            self.nextPosition = 0
-        return self._capture
+    def openContainer(self) -> None:
+        """Opens the video, if needed, and describes it from its stream's color tags."""
+        if(self.container is not None):
+            return
+        self.container = av.open(self.path)
+        self.stream = self.container.streams.video[0]
+        codec = self.stream.codec_context
+        self.width, self.height = codec.width, codec.height
+        self.videoBits = 8
+        formatName = ""
+        isYUV = True
+        if(codec.format is not None):
+            self.videoBits = codec.format.components[0].bits
+            formatName = codec.format.name
+            isYUV = not codec.format.is_rgb and len(codec.format.components) >= 3
+        self.params, self.workingSpace = ColorSpace.fromVideoTags(primaries=codec.color_primaries,
+                                                                  transfer=codec.color_trc,
+                                                                  matrix=codec.colorspace,
+                                                                  colorRange=codec.color_range,
+                                                                  isYUV=isYUV,
+                                                                  fullRangeFormat=formatName.startswith("yuvj"))
+        self.decoder = None
+        self.lastTimestamp = None
+        self.lastFrame = None
 
-    def _frameTimes(self) -> list[float]:
-        """Returns the cached times of the frames.
-
-        The times are read by grabbing every frame sequentially the first time.
+    def frameTimestamps(self) -> list[int]:
+        """Returns the presentation timestamps of the frames, read from the packets the first time.
 
         Returns:
-            The frame times in milliseconds, in frame order.
+            The sorted timestamps, in the stream's time base.
         """
-        if(self.times is None):
-            capture = cv2.VideoCapture(self.path)
-            try:
-                times = []
-                while(capture.grab()):
-                    times.append(capture.get(cv2.CAP_PROP_POS_MSEC))
-                self.times = times
-            finally:
-                capture.release()
-        return self.times
+        if(self.timestamps is None):
+            self.openContainer()
+            timestamps = set()
+            for packet in self.container.demux(self.stream):
+                timestamp = packet.pts if packet.pts is not None else packet.dts
+                if(timestamp is not None and packet.size > 0):
+                    timestamps.add(timestamp)
+            self.decoder = None
+            self.timestamps = sorted(timestamps)
+        return self.timestamps
 
     def frameCount(self) -> int:
-        """The count comes from grabbing every frame, since CAP_PROP_FRAME_COUNT is only the container's estimate."""
-        return len(self._frameTimes())
+        """The count is the number of distinct timestamps among the video's packets."""
+        return len(self.frameTimestamps())
 
-    def _seekBefore(self, index: int) -> None:
-        """Seeks to the frame, or to an earlier frame that reading forward reaches it from.
-
-        Usage: To find your desired frame at `index`, run _seekBefore() then sequentially
-        read frames until `self.nextPosition == index + 1`.
-
-        A naive approach that simply seeks to the time given by the index is NOT
-        guaranteed to make OpenCV return the expected frame.  Often, a seek + read() will
-        give you 2, 3 or even more frames into the future depending on how many missing
-        frames there are inside the file container. This is likely some combination of
-        file corruption and OpenCV bug.
+    def frameToImage(self, videoFrame: av.VideoFrame) -> np.ndarray:
+        """Converts a decoded frame to RGB with the stream's YUV -> RGB matrix, expanding limited range.
 
         Args:
-            index: The frame's index.
-        """
-        times = self._frameTimes()
-        start = index
-        back = 1
-        while(True):
-            self.capture.set(cv2.CAP_PROP_POS_MSEC, times[start])
-            if(self.capture.grab()):
-                time: float = self.capture.get(cv2.CAP_PROP_POS_MSEC)
-                landed: int = bisect.bisect_left(times, time)
-                if(landed <= index):
-                    self.nextPosition = landed + 1
-                    return
-            if(start == 0):
-                break
-            start = max(0, index - back)
-            back *= 2
-        # We gave up on rewinding, so just close the capture. Callers will start searching from frame 0.
-        self.close()
-
-    def readFrame(self, index: int) -> np.ndarray | None:
-        # Skip seeking when the next frame is already what you want.
-        # This improves performance drastically.
-        shouldSeek = index != self.nextPosition
-        if(shouldSeek):
-            # Don't seek to some far off place beyond the end of the frame.
-            if(index >= len(self._frameTimes())):
-                return None
-            self._seekBefore(index)
-            if(self.nextPosition == index + 1):
-                return self._retrieve()
-        # Read forward to the desired frame.
-        while(self.capture.grab()):
-            currentPosition = self.nextPosition
-            self.nextPosition += 1
-            if(currentPosition == index):
-                return self._retrieve()
-        self.nextPosition = None
-        return None
-
-    def _retrieve(self) -> np.ndarray | None:
-        """Decodes the frame the capture last grabbed.
+            videoFrame: The decoded frame.
 
         Returns:
-            The frame, or None if it can't be decoded.
+            The full range uint16 BGR image.
         """
-        success, image = self.capture.retrieve()
-        if(not success):
-            self.nextPosition = None
+        isYUV = self.params.yuvMatrix is not None
+        sourceRange = "MPEG" if self.params.range == "limited" else "JPEG"
+        image = videoFrame.reformat(format="rgb48le",
+                                    src_colorspace=AV_MATRICES[self.params.yuvMatrix] if isYUV else None,
+                                    src_color_range=sourceRange if isYUV else "JPEG",
+                                    dst_color_range="JPEG",
+                                    interpolation="BILINEAR").to_ndarray()
+        if(not isYUV and self.params.range == "limited"):
+            maxVal = np.iinfo(image.dtype).max
+            scaled = (image.astype(np.float32)/maxVal*255 - 16)/219
+            image = np.around(np.clip(scaled, 0, 1)*maxVal).astype(image.dtype)
+        return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+    def readFrame(self, index: int) -> Frame | None:
+        """Frames are converted to 16-bit BGR, whatever the stream's depth."""
+        timestamps = self.frameTimestamps()
+        if(index >= len(timestamps)):
             return None
-        return image
+        self.openContainer()
+        target = timestamps[index]
+        if(self.lastFrame is None or target != self.lastTimestamp):
+            if(self.decoder is None or self.lastTimestamp is None or target < self.lastTimestamp or
+               target - self.lastTimestamp > 1/self.stream.time_base):
+                self.container.seek(target, stream=self.stream, backward=True)
+                self.decoder = self.container.decode(self.stream)
+            self.lastFrame = None
+            for videoFrame in self.decoder:
+                timestamp = videoFrame.pts if videoFrame.pts is not None else videoFrame.dts
+                if(timestamp is not None and timestamp >= target):
+                    self.lastTimestamp = timestamp
+                    self.lastFrame = videoFrame
+                    break
+            if(self.lastFrame is None):
+                self.decoder = None
+                return None
+        if(self.lastTimestamp != target):
+            # The frame couldn't be decoded
+            return None
+        return Frame(image=self.frameToImage(self.lastFrame),
+                     params=self.params,
+                     workingSpace=self.workingSpace)
+
+    def description(self) -> tuple[ColorSpace.DecodeParams, ColorSpace.WorkingSpace]:
+        """The stream's color tags describe every frame, so nothing is decoded."""
+        self.openContainer()
+        return (self.params, self.workingSpace)
+
+    def recordedBits(self) -> int | None:
+        self.openContainer()
+        return 8 if self.videoBits <= 8 else None
 
     def frameSize(self) -> tuple[int, int]:
-        return (int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        self.openContainer()
+        return (self.width, self.height)
 
     def close(self) -> None:
-        if(self._capture is not None):
-            self._capture.release()
-            self._capture = None
-            self.nextPosition = 0
+        if(self.container is not None):
+            self.container.close()
+            self.container = None
+
+# PyAV names of the YUV -> RGB matrices
+AV_MATRICES = {"BT.601": "ITU601",
+               "BT.709": "ITU709",
+               "BT.2020": "BT2020"}

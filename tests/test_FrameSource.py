@@ -51,7 +51,7 @@ class TestImageSequenceSource(unittest.TestCase):
         source = ImageSequenceSource(PNG8_SEQUENCE)
 
         for index in [2, 0, 3, 1, 1, 2]:
-            assert np.array_equal(source.readFrame(index), cv2.imread(PNG8_SEQUENCE[index], cv2.IMREAD_UNCHANGED))
+            assert np.array_equal(source.readFrame(index).image, cv2.imread(PNG8_SEQUENCE[index], cv2.IMREAD_UNCHANGED))
 
     @ddt.data(
         # An 8-bit PNG reads as 8 bits.
@@ -68,7 +68,7 @@ class TestImageSequenceSource(unittest.TestCase):
         """Color frames are read with three channels at their stored depth, and frameSize agrees with them."""
         source = ImageSequenceSource([path])
 
-        frame = source.readFrame(0)
+        frame = source.readFrame(0).image
 
         assert frame.dtype == dtype
         assert frame.ndim == 3 and frame.shape[2] == 3
@@ -81,12 +81,12 @@ class TestImageSequenceSource(unittest.TestCase):
     def test_pickles(self) -> None:
         """A source survives a pickle round trip and reads the same frames."""
         source = ImageSequenceSource(PNG8_SEQUENCE)
-        before = source.readFrame(1)
+        before = source.readFrame(1).image
 
         source = pickle.loads(pickle.dumps(source))
 
         assert source.paths == PNG8_SEQUENCE
-        assert np.array_equal(source.readFrame(1), before)
+        assert np.array_equal(source.readFrame(1).image, before)
 
 
 @ddt.ddt
@@ -105,7 +105,7 @@ class TestVideoSource(unittest.TestCase):
         """
         source = VideoSource(path)
         try:
-            return [source.readFrame(index) for index in range(source.frameCount())]
+            return [source.readFrame(index).image for index in range(source.frameCount())]
         finally:
             source.close()
 
@@ -119,23 +119,24 @@ class TestVideoSource(unittest.TestCase):
     def test_frameCount_is_counted_once(self) -> None:
         """The frames are counted once, the first time the count is needed."""
         source = VideoSource(MP4_YUV8)
-        assert source.times is None
+        assert source.timestamps is None
         # Reading just the first frame does not trigger a full read. This
         # behavior is what makes thumbnail generation quick.
         source.readFrame(0)
-        assert source.times is None
+        assert source.timestamps is None
 
         assert source.frameCount() == MP4_YUV8_FRAME_COUNT
+        source.close()
         source.path = "missing.avi"
         assert source.frameCount() == MP4_YUV8_FRAME_COUNT
 
     def test_readFrame_in_any_order(self) -> None:
         """Frames are read in any order and repeatedly."""
         source = VideoSource(MP4_YUV8)
-        sequential = [source.readFrame(index) for index in range(source.frameCount())]
+        sequential = [source.readFrame(index).image for index in range(source.frameCount())]
 
         for index in [0, 1, 2, 40, 3, 59, 0, 40, 40, 2, 3]:
-            assert np.array_equal(source.readFrame(index), sequential[index]), index
+            assert np.array_equal(source.readFrame(index).image, sequential[index]), index
 
     def test_readFrame_past_end(self) -> None:
         """There is no frame past the end of the video, whether read in order or by seeking."""
@@ -147,18 +148,18 @@ class TestVideoSource(unittest.TestCase):
         assert VideoSource(MP4_YUV8).readFrame(MP4_YUV8_FRAME_COUNT) is None
 
     def test_pickles_without_capture(self) -> None:
-        """An open source pickles as its path and frame times, and the copy reads the same frames in any order."""
+        """An open source pickles as its path and timestamps, and the copy reads the same frames in any order."""
         source = VideoSource(MP4_YUV8)
-        sequential = [source.readFrame(index) for index in range(source.frameCount())]
-        times = source.times
+        sequential = [source.readFrame(index).image for index in range(source.frameCount())]
+        timestamps = source.timestamps
 
         source = pickle.loads(pickle.dumps(source))
 
         assert source.path == MP4_YUV8
-        assert source.times == times
-        assert source._capture is None
+        assert source.timestamps == timestamps
+        assert source.container is None
         for index in [2, 0, 5, 5, 3, 1, 4]:
-            assert np.array_equal(source.readFrame(index), sequential[index])
+            assert np.array_equal(source.readFrame(index).image, sequential[index])
 
     @ddt.data(
         # The first read is frame 1, which used to read frame 0.
@@ -181,7 +182,7 @@ class TestVideoSource(unittest.TestCase):
         source = pickle.loads(pickle.dumps(source))
 
         for index in order:
-            assert np.array_equal(source.readFrame(index), expectedFrames[index]), index
+            assert np.array_equal(source.readFrame(index).image, expectedFrames[index]), index
 
     def test_dropped_frames_avi_is_missing_frames(self) -> None:
         """Make sure the dropped frames test video has gaps.
@@ -206,8 +207,8 @@ class TestVideoSource(unittest.TestCase):
     def test_reads_correct_frame_however_reached(self, path: str) -> None:
         """A video always fetches the correct frame no matter where we start.
 
-        OpenCV doesn't always land on the frame it seeks to, but our VideoSource wraps OpenCV
-        and is designed to work around OpenCV's limitations.
+        Seeking doesn't always land on the frame asked for, so VideoSource seeks to an earlier
+        keyframe and decodes forward from it.
 
         Check that it works by seeking to many points in the video and doing many
         different lengths of sequential reads. This hopefully simulates both a user
@@ -246,7 +247,7 @@ class TestVideoSource(unittest.TestCase):
         # pickle + unpickle the VideoSource to simulate being passed into a worker process.
         source = pickle.loads(pickle.dumps(source))
         actualFrames = [
-            (name, index, source.readFrame(index))
+            (name, index, source.readFrame(index).image)
             for name, run in runs for index in run
         ]
 
@@ -335,6 +336,21 @@ class TestOpen(unittest.TestCase):
         assert source.readFrame(0) is not None
         assert source.readFrame(source.frameCount() - 1) is not None
         assert source.readFrame(source.frameCount()) is None
+
+    @ddt.data(
+        # An untagged image sequence.
+        {"path": PNG8_SEQUENCE},
+        # An untagged video.
+        {"path": MP4_YUV8},
+    )
+    @ddt.unpack
+    def test_description_is_the_first_frames(self, path: str | list[str]) -> None:
+        """A source is described like its first frame, and untagged images and videos state no Bayer pattern."""
+        source = FrameSource.open(path)
+        frame = source.readFrame(0)
+
+        assert source.description() == (frame.params, frame.workingSpace)
+        assert source.description()[0].bayerPattern is None
 
     @ddt.data(
         # A single image is a one-frame sequence.

@@ -362,7 +362,7 @@ class UI:
                     img = Video(source).thumbnail()
                 finally:
                     source.close()
-                pixbuf = self.createPixbuf(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                pixbuf = self.createPixbuf(cv2.cvtColor(img*255, cv2.COLOR_BGR2RGB).astype('uint8'))
             except Exception:
                 pass
         if(pixbuf is not None):
@@ -448,6 +448,7 @@ class UI:
         g.source = source
         try:
             self.video = Video(source)
+            g.decodeParams, g.workingSpace = self.video.description()
             g.guessedColorMode = self.video.guessColorMode()
             self.video.checkMemory()
 
@@ -464,14 +465,8 @@ class UI:
             self.builder.get_object("processTab").set_sensitive(True)
             self.tabs.set_current_page(UI.PROCESS_TAB)
 
-            img = cv2.cvtColor(
-                self.video.getFrame(
-                    index=0,
-                    colorMode=g.actualColor(),
-                    toDtype=np.uint8,
-                ),
-                cv2.COLOR_BGR2RGB,
-            )
+            img = cv2.cvtColor(self.video.getFrame(index=0, colorMode=g.actualColor())*255,
+                               cv2.COLOR_BGR2RGB).astype('uint8')
             pixbuf = self.createPixbuf(img)
             self.frame.set_from_pixbuf(pixbuf.copy())
         except MemoryError:
@@ -694,11 +689,7 @@ class UI:
             tmat = self.stack.tmats[int(self.frameSlider.get_value())]
             videoIndex = tmat[0]
             M = tmat[1]
-            img = self.video.getFrame(
-                index=videoIndex,
-                colorMode=g.actualColor(),
-                toDtype=np.uint8,
-            )
+            img = (self.video.getFrame(videoIndex, g.actualColor())*255).astype(np.uint8)
             if(g.autoCrop):
                 ref = (self.stack.refBG*255).astype(np.uint8)
             else:

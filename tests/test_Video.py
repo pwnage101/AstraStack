@@ -33,11 +33,11 @@ def test_single_image_getFrame_scales_to_0_1(tmp_path: pathlib.Path, dtype: type
 @pytest.mark.parametrize("colorMode", [Video.COLOR_AUTO, Video.COLOR_RGB, Video.COLOR_GRAYSCALE, Video.COLOR_RGGB])
 @pytest.mark.parametrize("name", ["image.png", "image.jpg"])
 def test_single_image_getFrame_matches_readFrame(tmp_path: pathlib.Path, colorMode: int, name: str) -> None:
-    """A single image opened as a source reads as its decoded frame, with the color mode applied."""
+    """An untagged single image reads as its decoded frame with the color mode applied, unchanged."""
     rng = np.random.default_rng(seed=0)
     path = str(tmp_path / name)
     cv2.imwrite(path, rng.integers(low=0, high=256, size=(24, 32, 3), dtype=np.uint8))
-    image = ImageSequenceSource(path).readFrame(0)
+    image = ImageSequenceSource(path).readFrame(0).image
     expectedMode = Video.COLOR_RGB if colorMode == Video.COLOR_AUTO else colorMode
     expected = Video._bgrFromSourceFrame(
         image=image,
@@ -76,10 +76,11 @@ def test_loadFrames_skips_other_sizes() -> None:
     """Frames whose size differs are skipped, and every index is counted."""
     progress = FakeProgress()
 
-    frames, sharps, deltas = loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
+    frames, sharps, deltas, mismatch = loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
                                         indices=range(0, 4),
                                         frameSize=PNG8_MIXED_SIZE_SEQUENCE_DIMENSIONS,
                                         colorMode=Video.COLOR_RGB,
+                                        description=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE).description(),
                                         progress=progress)
 
     assert frames == [0, 2, 3]
@@ -96,12 +97,14 @@ def test_loadFrames_uses_frame_before_chunk() -> None:
                            indices=range(0, 4),
                            frameSize=PNG8_MIXED_SIZE_SEQUENCE_DIMENSIONS,
                            colorMode=Video.COLOR_RGB,
+                           description=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE).description(),
                            progress=FakeProgress())
 
-    frames, sharps, deltas = loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
+    frames, sharps, deltas, mismatch = loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
                                         indices=range(3, 4),
                                         frameSize=PNG8_MIXED_SIZE_SEQUENCE_DIMENSIONS,
                                         colorMode=Video.COLOR_RGB,
+                                        description=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE).description(),
                                         progress=FakeProgress())
 
     assert frames == [3]
@@ -113,10 +116,11 @@ def test_loadFrames_past_end() -> None:
     """Indices past the last frame are counted but load nothing."""
     progress = FakeProgress()
 
-    frames, sharps, deltas = loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
+    frames, sharps, deltas, mismatch = loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
                                         indices=range(3, 7),
                                         frameSize=PNG8_MIXED_SIZE_SEQUENCE_DIMENSIONS,
                                         colorMode=Video.COLOR_RGB,
+                                        description=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE).description(),
                                         progress=progress)
 
     assert frames == [3]
@@ -137,10 +141,10 @@ def test_guessColorMode_guesses_from_first_frame() -> None:
 
 
 def test_loadFrames_measures_16bit_frames_at_8_bits(tmp_path: pathlib.Path) -> None:
-    """A 16-bit sequence loads with the same sharpness and deltas as its high bytes saved at 8 bits."""
+    """A 16-bit sequence loads with the same sharpness and deltas as the same values saved at 8 bits."""
     paths16 = []
     for index, path in enumerate(PNG8_MIXED_SIZE_SEQUENCE):
-        image = cv2.imread(path, cv2.IMREAD_UNCHANGED).astype(np.uint16)*256 + 77
+        image = cv2.imread(path, cv2.IMREAD_UNCHANGED).astype(np.uint16)*257
         path16 = str(tmp_path / f"seq16_{index}.png")
         cv2.imwrite(path16, image)
         paths16.append(path16)
@@ -149,11 +153,14 @@ def test_loadFrames_measures_16bit_frames_at_8_bits(tmp_path: pathlib.Path) -> N
                          indices=range(0, 4),
                          frameSize=PNG8_MIXED_SIZE_SEQUENCE_DIMENSIONS,
                          colorMode=Video.COLOR_RGB,
+                         description=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE).description(),
                          progress=FakeProgress())
     loaded16 = loadFrames(source=ImageSequenceSource(paths16),
                           indices=range(0, 4),
                           frameSize=PNG8_MIXED_SIZE_SEQUENCE_DIMENSIONS,
                           colorMode=Video.COLOR_RGB,
+                          # The copies lose the sRGB tag, so describe them like the originals.
+                          description=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE).description(),
                           progress=FakeProgress())
 
     assert loaded16[0] == loaded8[0]
@@ -162,31 +169,31 @@ def test_loadFrames_measures_16bit_frames_at_8_bits(tmp_path: pathlib.Path) -> N
         assert np.array_equal(delta16, delta8)
 
 
-@mock.patch.object(Video, "_bgrFromSourceFrame", wraps=Video._bgrFromSourceFrame)
-def test_loadFrames_applies_color_mode_once(bgrFromSourceFrame: mock.MagicMock) -> None:
+@mock.patch.object(Video, "_applyColorMode", wraps=Video._applyColorMode)
+def test_loadFrames_applies_color_mode_once(applyColorMode: mock.MagicMock) -> None:
     """The color mode is applied once to each frame read, including the frame before the chunk."""
     loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
                indices=range(3, 4),
                frameSize=PNG8_MIXED_SIZE_SEQUENCE_DIMENSIONS,
                colorMode=Video.COLOR_GRBG,
+               description=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE).description(),
                progress=FakeProgress())
 
-    assert [call.kwargs["colorMode"] for call in bgrFromSourceFrame.call_args_list] == [Video.COLOR_GRBG]*2
+    assert [call.kwargs["colorMode"] for call in applyColorMode.call_args_list] == [Video.COLOR_GRBG]*2
 
 
 @pytest.mark.parametrize("colorMode", [Video.COLOR_RGB, Video.COLOR_GRAYSCALE, Video.COLOR_GRBG])
 def test_loadFrames_measures_sharpness_after_color_mode(colorMode: int) -> None:
-    """Sharpness is measured on the frame after the color mode is applied."""
-    frames, sharps, deltas = loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
+    """Sharpness is measured on the sRGB-encoded frame after the color mode is applied."""
+    frames, sharps, deltas, mismatch = loadFrames(source=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE),
                                         indices=range(0, 3),
                                         frameSize=PNG8_MIXED_SIZE_SEQUENCE_DIMENSIONS,
                                         colorMode=colorMode,
+                                        description=ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE).description(),
                                         progress=FakeProgress())
 
+    video = Video(ImageSequenceSource(PNG8_MIXED_SIZE_SEQUENCE))
     for index, sharp in zip(frames, sharps):
-        image = Video._bgrFromSourceFrame(
-            image=cv2.imread(PNG8_MIXED_SIZE_SEQUENCE[index], cv2.IMREAD_UNCHANGED),
-            colorMode=colorMode,
-            toDtype=np.uint8,
-        )
-        assert sharp == calculateSharpness(image)
+        linear = video.getFrame(index=index,
+                                colorMode=colorMode)
+        assert sharp == calculateSharpness(Video.encodedCopy(linear, video.workingSpace))
