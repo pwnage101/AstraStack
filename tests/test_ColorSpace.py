@@ -566,3 +566,29 @@ def test_srgb_png_chunks() -> None:
     params, workingSpace = ColorSpace.fromPNGChunks(chunks=ColorSpace.srgbPNGChunks(), channels=3)
     assert params.transfer == ("sRGB", None)
     assert workingSpace is ColorSpace.SRGB
+
+
+@pytest.mark.parametrize("bits, colorRange, black, white",
+                         [(8, "limited", 16, 235),
+                          (8, "full", 0, 255),
+                          (10, "limited", 64, 940),
+                          (10, "full", 0, 1023)])
+def test_yuvToRGB_range(bits: int, colorRange: str, black: int, white: int) -> None:
+    """Black and white with neutral chroma decode to 0 and 1, in limited and full range."""
+    neutral = 2**(bits - 1) if colorRange == "full" else 128*2**(bits - 8)
+    for matrix in ("BT.601", "BT.709", "BT.2020"):
+        yuv = np.array([[[black, white]], [[neutral, neutral]], [[neutral, neutral]]])
+        rgb = ColorSpace.yuvToRGB(yuv=yuv, bits=bits, matrix=matrix, colorRange=colorRange)
+        assert np.allclose(rgb[0, 0], 0, atol=1e-6)
+        assert np.allclose(rgb[0, 1], 1, atol=2e-3 if colorRange == "full" else 1e-6)
+
+
+def test_yuvToRGB_matrix() -> None:
+    """The matrix gives the primaries' luminance weights back: pure red's Y is Kr."""
+    for matrix, (kr, kb) in ColorSpace.YUV_WEIGHTS.items():
+        y = kr
+        cb = (0 - y)/(2*(1 - kb))
+        cr = (1 - y)/(2*(1 - kr))
+        yuv = np.array([[[16 + 219*y]], [[128 + 224*cb]], [[128 + 224*cr]]])
+        rgb = ColorSpace.yuvToRGB(yuv=yuv, bits=8, matrix=matrix, colorRange="limited")
+        assert np.allclose(rgb[0, 0], [1, 0, 0], atol=1e-5)

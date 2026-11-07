@@ -301,7 +301,11 @@ class VideoSource(FrameSource):
         return len(self.frameTimestamps())
 
     def frameToImage(self, videoFrame: av.VideoFrame) -> np.ndarray:
-        """Converts a decoded frame to RGB with the stream's YUV -> RGB matrix, expanding limited range.
+        """Converts a decoded frame to full range RGB with the stream's YUV -> RGB matrix and range.
+
+        swscale only upsamples the chroma, at the source's bit depth; the range expansion and the
+        matrix are applied here, since swscale's 16-bit RGB output expands limited range
+        inaccurately.
 
         Args:
             videoFrame: The decoded frame.
@@ -309,17 +313,27 @@ class VideoSource(FrameSource):
         Returns:
             The full range uint16 BGR image.
         """
-        isYUV = self.params.yuvMatrix is not None
-        sourceRange = "MPEG" if self.params.range == "limited" else "JPEG"
-        image = videoFrame.reformat(format="rgb48le",
-                                    src_colorspace=AV_MATRICES[self.params.yuvMatrix] if isYUV else None,
-                                    src_color_range=sourceRange if isYUV else "JPEG",
-                                    dst_color_range="JPEG",
-                                    interpolation="BILINEAR").to_ndarray()
-        if(not isYUV and self.params.range == "limited"):
-            maxVal = np.iinfo(image.dtype).max
-            scaled = (image.astype(np.float32)/maxVal*255 - 16)/219
-            image = np.around(np.clip(scaled, 0, 1)*maxVal).astype(image.dtype)
+        if(self.params.yuvMatrix is not None):
+            sourceBits = max(8, min(16, videoFrame.format.components[0].bits))
+            yuvFormat = "yuv444p" if sourceBits == 8 else "yuv444p" + str(sourceBits) + "le"
+            yuvFrame = videoFrame.reformat(format=yuvFormat)
+            dtype = np.uint8 if sourceBits == 8 else np.uint16
+            planes = [np.frombuffer(plane, dtype).reshape(yuvFrame.height, -1)[:, :yuvFrame.width]
+                      for plane in yuvFrame.planes]
+            rgb = ColorSpace.yuvToRGB(yuv=np.stack(planes),
+                                      bits=sourceBits,
+                                      matrix=self.params.yuvMatrix,
+                                      colorRange=self.params.range)
+            image = ColorSpace.quantize(img=rgb, bits=16)
+        else:
+            # Converted at the source's bit depth and widened exactly, so untagged RGB/gray loads unchanged
+            sourceBits = 8 if videoFrame.format.components[0].bits <= 8 else 16
+            image = videoFrame.reformat(format="rgb24" if sourceBits == 8 else "rgb48le").to_ndarray()
+            if(sourceBits == 8):
+                image = image.astype(np.uint16)*257
+            if(self.params.range == "limited"):
+                scaled = (image.astype(np.float32)/65535*255 - 16)/219
+                image = np.around(np.clip(scaled, 0, 1)*65535).astype(np.uint16)
         return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
     def readFrame(self, index: int) -> Frame | None:
@@ -369,7 +383,3 @@ class VideoSource(FrameSource):
             self.container.close()
             self.container = None
 
-# PyAV names of the YUV -> RGB matrices
-AV_MATRICES = {"BT.601": "ITU601",
-               "BT.709": "ITU709",
-               "BT.2020": "BT2020"}

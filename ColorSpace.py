@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Literal
 from lazy import lazy
 np = lazy("numpy")
@@ -771,6 +772,48 @@ def fromVideoTags(primaries: int | None,
     return (params, cicpPrimaries(primaries))
 
 
+# Luminance weights (Kr, Kb) of the YUV matrices
+YUV_WEIGHTS = {"BT.601": (0.299, 0.114),
+               "BT.709": (0.2126, 0.0722),
+               "BT.2020": (0.2627, 0.0593)}
+
+
+def yuvToRGB(yuv: np.ndarray,
+             bits: int,
+             matrix: Literal["BT.601", "BT.709", "BT.2020"],
+             colorRange: Literal["limited", "full"]) -> np.ndarray:
+    """Converts 4:4:4 YUV to full range RGB, expanding limited range.
+
+    Limited range Y 16-235 and Cb/Cr 16-240 (scaled for higher bit depths) become 0-1; values outside the nominal
+    range are clipped.
+
+    Args:
+        yuv: The Y, Cb and Cr planes, stacked on the first axis, as stored integers.
+        bits: Bit depth of the stored values.
+        matrix: The YUV -> RGB matrix.
+        colorRange: Whether the values are limited or full range.
+
+    Returns:
+        The float32 RGB image (channels last), within 0-1.
+    """
+    scale = 2**(bits - 8)
+    y, cb, cr = [plane.astype(np.float32) for plane in yuv]
+    if(colorRange == "limited"):
+        y = (y - 16*scale)/(219*scale)
+        cb = (cb - 128*scale)/(224*scale)
+        cr = (cr - 128*scale)/(224*scale)
+    else:
+        maxVal = 2**bits - 1
+        y = y/maxVal
+        cb = (cb - 2**(bits - 1))/maxVal
+        cr = (cr - 2**(bits - 1))/maxVal
+    kr, kb = YUV_WEIGHTS[matrix]
+    r = y + 2*(1 - kr)*cr
+    b = y + 2*(1 - kb)*cb
+    g = (y - kr*r - kb*b)/(1 - kr - kb)
+    return np.clip(np.dstack([r, g, b]), 0, 1).astype(np.float32)
+
+
 def rawRGBCam(raw: object) -> np.ndarray | None:
     """Returns the camera -> linear sRGB matrix of a RAW file, whose rows sum to 1.
 
@@ -1006,6 +1049,7 @@ def describeImage(file: str, channels: int) -> tuple[DecodeParams, WorkingSpace]
     return description
 
 
+@cache
 def srgbProfile() -> bytes:
     """Returns LittleCMS's sRGB ICC profile, embedded in every saved file.
 
