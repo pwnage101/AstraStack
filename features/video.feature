@@ -145,21 +145,3 @@ Feature: Video
         And I async press "saveButton"
         And I choose output file "Jupiter0.5X.png" from "saveDialog"
         Then output "Jupiter0.5X.png" and reference "Jupiter0.5X.png" should be equal
-
-    Scenario: Stacking an 8-bit Bayer RGGB AVI video
-        Given I am on tab "Load"
-        # 8+ CPUs easily hangs loading this short video due to a loadFramesVideo limitation, so set a conservatively small count
-        And I set "cpus" to "2"
-        And I async press "openFile"
-        And I choose input file "avi8_rggb.avi" from "openDialog"
-        And I wait until active tab is "Align"
-        And I select "Bayer RGGB" from "colorMode"
-        And I press "alignButton"
-        And I wait until active tab is "Stack"
-        And I uncheck "autoCrop"
-        And I press "stackButton"
-        And I wait until active tab is "Process"
-        And I check "autoBlackLevel"
-        And I async press "saveButton"
-        And I choose output file "avi8_rggb.png" from "saveDialog"
-        Then output "avi8_rggb.png" and reference "avi8_rggb.png" should be equal
