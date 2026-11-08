@@ -1,15 +1,15 @@
 """Tests for ColorSpace.py."""
-import copy
-import pickle
 import struct
 import zlib
 from types import SimpleNamespace
 
 import colour
+import imagecodecs
 import numpy as np
 import pytest
 
 import ColorSpace
+from inputs import INPUTS_DIR
 
 D65_XYZ = np.array(ColorSpace.D65_XYZ)
 
@@ -25,79 +25,14 @@ A7III_RGB_CAM = np.array([[1.6354, -0.4220, -0.2134],
                           [-0.1311, 1.5427, -0.4116],
                           [0.0114, -0.4196, 1.4082]])
 
-NAMED_TRANSFERS = [("sRGB", None),
-                   ("BT.709", None),
-                   ("BT.601", None),
-                   ("BT.2020", None),
-                   ("HLG", None),
-                   ("PQ", 203.0),
-                   ("Gamma", 2.2),
-                   ("Gamma", ColorSpace.LUT_GAMMA)]
-
-
-def curvTag(values: np.ndarray) -> bytes:
-    """Returns an ICC curv tag holding a table.
-
-    Args:
-        values: Linear values (0-1) of the table entries.
-
-    Returns:
-        The tag data.
-    """
-    table = np.around(np.asarray(values)*65535).astype(">u2")
-    return b"curv" + bytes(4) + struct.pack(">I", len(table)) + table.tobytes()
-
-
-def paraSRGBTag() -> bytes:
-    """Returns an ICC para tag (function type 3) holding the sRGB curve.
-
-    Returns:
-        The tag data.
-    """
-    values = (2.4, 1/1.055, 0.055/1.055, 1/12.92, 0.04045)
-    return b"para" + bytes(4) + struct.pack(">HH", 3, 0) + struct.pack(">5i", *[int(round(v*65536)) for v in values])
-
 
 def p3Profile() -> bytes:
-    """Returns a matrix/TRC ICC profile with Display P3 primaries and a gamma 2.2 curve.
+    """Returns the color inputs' Display P3 profile, a matrix/TRC profile with an sRGB para curve.
 
     Returns:
         The profile bytes.
     """
-    return ColorSpace.matrixProfile(toXYZ=ColorSpace.named("Display P3").toXYZ, description="P3", gamma=2.2)
-
-
-def lutSRGBProfile() -> bytes:
-    """Returns a LUT based (mft2) input profile that describes sRGB.
-
-    Returns:
-        The profile bytes.
-    """
-    chad = ColorSpace.bradford(ColorSpace.D65_XYZ, ColorSpace.D50_XYZ)
-    colorants = chad @ ColorSpace.SRGB.toXYZ
-    curve = np.around(colour.models.eotf_sRGB(np.linspace(0, 1, 256))*65535).astype(">u2").tobytes()
-    clut = b""
-    for r in (0, 1):
-        for g in (0, 1):
-            for b in (0, 1):
-                clut += np.around(np.clip(colorants @ np.array([r, g, b]), 0, 1.99)*32768).astype(">u2").tobytes()
-    identity = struct.pack(">9i", *(65536*np.eye(3).astype(int).flatten()))
-    mft2 = (b"mft2" + bytes(4) + struct.pack(">BBBB", 3, 3, 2, 0) + identity + struct.pack(">HH", 256, 2) +
-            curve*3 + clut + struct.pack(">HH", 0, 65535)*3)
-    ascii = b"LUT sRGB\0"
-    tags = [(b"desc", b"desc" + bytes(4) + struct.pack(">I", len(ascii)) + ascii + bytes(4 + 4 + 2 + 1 + 67)),
-            (b"wtpt", b"XYZ " + bytes(4) + struct.pack(">3i", *[int(round(v*65536)) for v in ColorSpace.D50_XYZ])),
-            (b"A2B0", mft2)]
-    offset = 128 + 4 + 12*len(tags)
-    table = struct.pack(">I", len(tags))
-    data = b""
-    for signature, tag in tags:
-        table += signature + struct.pack(">II", offset + len(data), len(tag))
-        data += tag + bytes(-len(tag) % 4)
-    header = (struct.pack(">I", offset + len(data)) + bytes(4) + struct.pack(">I", 0x02100000) + b"scnrRGB XYZ " +
-              bytes(12) + b"acsp" + bytes(24) + struct.pack(">I", 0) +
-              struct.pack(">3i", *[int(round(v*65536)) for v in ColorSpace.D50_XYZ]) + bytes(48))
-    return header + table + data
+    return (INPUTS_DIR/"color"/"DisplayP3-v4.icc").read_bytes()
 
 
 def fakeRaw(**overrides: object) -> SimpleNamespace:
@@ -137,37 +72,18 @@ def chrm(white: tuple, primaries: tuple) -> bytes:
 SRGB_CHRM = chrm(white=(0.3127, 0.3290), primaries=((0.64, 0.33), (0.30, 0.60), (0.15, 0.06)))
 
 
-@pytest.mark.parametrize("transfer", NAMED_TRANSFERS)
-def test_transfer_round_trip(transfer: tuple) -> None:
-    """Every named transfer function decodes what it encodes."""
-    x = np.linspace(0, 1, 1001)
-    assert np.allclose(ColorSpace.transferToLinear(x=ColorSpace.linearToTransfer(y=x, transfer=transfer),
-                                                   transfer=transfer),
-                       x,
-                       atol=1e-9)
-
-
 def test_transfer_known_values() -> None:
     """The transfer functions give their standard values."""
     assert ColorSpace.transferToLinear(x=np.array(0.5), transfer=("sRGB", None)) == pytest.approx(0.2140, abs=1e-4)
     assert ColorSpace.transferToLinear(x=np.array(0.5), transfer=("Gamma", 2.2)) == pytest.approx(0.5**2.2)
     assert ColorSpace.transferToLinear(x=np.array(0.081), transfer=("BT.709", None)) == pytest.approx(0.018, abs=1e-6)
     pqWhite = colour.models.eotf_inverse_ST2084(203.0)
-    assert ColorSpace.transferToLinear(x=np.array(pqWhite), transfer=("PQ", 203.0)) == pytest.approx(1.0)
-    assert ColorSpace.transferToLinear(x=np.array(0.5), transfer=("HLG", None)) == pytest.approx(1/12)
+    assert ColorSpace.transferToLinear(x=np.array(pqWhite),
+                                       transfer=("PQ", None)) == pytest.approx(1.0)
+    assert ColorSpace.transferToLinear(x=np.array(0.75), transfer=("HLG", None)) == pytest.approx(1.0, abs=1e-6)
+    assert ColorSpace.transferToLinear(x=np.array(1.0), transfer=("HLG", None)) == pytest.approx(3.774, abs=1e-3)
     x = np.linspace(0, 1, 5)
     assert np.array_equal(ColorSpace.transferToLinear(x=x, transfer=None), x)
-
-
-@pytest.mark.parametrize("tag, expected",
-                         [(b"curv" + bytes(4) + struct.pack(">IH", 1, 563), lambda x: x**(563/256)),
-                          (b"curv" + bytes(8), lambda x: x),
-                          (curvTag(np.linspace(0, 1, 1024)**1.8), lambda x: x**1.8),
-                          (paraSRGBTag(), colour.models.eotf_sRGB)])
-def test_icc_curves(tag: bytes, expected: object) -> None:
-    """ICC curv (gamma, identity, table) and para curves decode as their formulas."""
-    x = np.linspace(0, 1, 257)
-    assert np.allclose(ColorSpace.curveToLinear(curve=ColorSpace.iccCurve(tag), x=x), expected(x), atol=2e-4)
 
 
 @pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
@@ -179,15 +95,14 @@ def test_linearizeInteger_matches_formula(dtype: type, transfer: tuple | None) -
     assert np.allclose(ColorSpace.linearizeInteger(img=codes, transfer=transfer), expected, atol=1e-6)
 
 
-def test_linearizeInteger_icc_channel_order() -> None:
-    """ICC curves apply per channel, reversed for BGR images."""
-    curves = (("gamma", 1.0), ("gamma", 2.0), ("gamma", 3.0))
-    img = np.full((1, 1, 3), 128, dtype=np.uint8)
-    rgb = ColorSpace.linearizeInteger(img=img, transfer=("ICC", curves))[0, 0]
-    bgr = ColorSpace.linearizeInteger(img=img, transfer=("ICC", curves), bgr=True)[0, 0]
-    v = 128/255
-    assert np.allclose(rgb, [v, v**2, v**3], atol=1e-6)
-    assert np.allclose(bgr, [v**3, v**2, v], atol=1e-6)
+def test_linearizeInteger_icc() -> None:
+    """ICC curves apply per channel, to RGB or BGR images."""
+    img = np.array([[[0, 128, 255]]], dtype=np.uint8)
+    expected = colour.models.eotf_sRGB(img[0, 0]/255)
+    rgb = ColorSpace.linearizeInteger(img=img, transfer=("ICC", p3Profile()))[0, 0]
+    bgr = ColorSpace.linearizeInteger(img=img[..., ::-1], transfer=("ICC", p3Profile()), bgr=True)[0, 0]
+    assert np.allclose(rgb, expected, atol=1e-4)
+    assert np.allclose(bgr, expected[::-1], atol=1e-4)
 
 
 @pytest.mark.parametrize("workingSpace",
@@ -201,12 +116,11 @@ def test_linearizeInteger_icc_channel_order() -> None:
                                                             chrm(white=(0.3457, 0.3585),
                                                                  primaries=((0.64, 0.33), (0.30, 0.60), (0.15, 0.06))))],
                                                    channels=3)[1],
-                          ColorSpace.fromLUTICC(lutSRGBProfile())[1],
                           ColorSpace.fromRAW(fakeRaw())[1],
                           ColorSpace.fromRAW(fakeRaw(rgb_xyz_matrix=np.zeros((4, 3)),
                                                      color_matrix=PIXEL_8A_COLOR_MATRIX))[1]],
                          ids=["sRGB", "P3", "Rec.2020", "BT.470 M (white C)", "DCI-P3 (DCI white)", "P3 ICC (D50)",
-                              "cHRM D50 white", "LUT ICC", "RAW rgb_xyz_matrix", "RAW color_matrix"])
+                              "cHRM D50 white", "RAW rgb_xyz_matrix", "RAW color_matrix"])
 def test_toXYZ_maps_white_to_d65(workingSpace: ColorSpace.WorkingSpace) -> None:
     """Every working space maps (1, 1, 1) to D65 white."""
     assert np.allclose(workingSpace.toXYZ @ np.ones(3), D65_XYZ, atol=1e-6)
@@ -227,74 +141,30 @@ def test_icc_srgb_profile_is_srgb() -> None:
     """LittleCMS's sRGB profile reads as the sRGB curve and primaries."""
     params, workingSpace = ColorSpace.fromICC(ColorSpace.srgbProfile())
     assert params == ColorSpace.DecodeParams(transfer=("sRGB", None))
-    assert workingSpace is ColorSpace.SRGB
+    assert workingSpace == ColorSpace.SRGB
 
 
 def test_icc_p3_profile() -> None:
-    """A D50-relative matrix/TRC profile reads as its D65 primaries and its curves."""
+    """A D50-relative matrix/TRC profile reads as its D65 primaries, and its curves as the sRGB curve they match."""
     params, workingSpace = ColorSpace.fromICC(p3Profile())
-    assert params.transfer == ("ICC", (("gamma", 563/256),)*3)
+    assert params.transfer == ("sRGB", None)
     assert np.allclose(workingSpace.toXYZ, ColorSpace.named("Display P3").toXYZ, atol=2e-4)
 
 
 def test_icc_profile_kinds() -> None:
     """Profiles are told apart by their tags."""
     assert ColorSpace.isMatrixProfile(p3Profile())
-    assert not ColorSpace.isMatrixProfile(lutSRGBProfile())
     assert not ColorSpace.isGrayProfile(p3Profile())
 
 
 def test_gray_icc() -> None:
-    """A gray profile gives its curve on every channel and no primaries."""
-    curve = b"curv" + bytes(4) + struct.pack(">IH", 1, 563)
-    profile = bytearray(ColorSpace.matrixProfile(toXYZ=ColorSpace.SRGB.toXYZ, description="g", gamma=1.0))
-    profile[16:20] = b"GRAY"
-    tags = ColorSpace.iccTags(bytes(profile))
-    assert "kTRC" not in tags
-    params, workingSpace = ColorSpace.fromGrayICC(grayProfileWithCurve(curve))
-    assert params.transfer == ("ICC", (("gamma", 563/256),)*3)
+    """A gray profile gives its curve and no primaries."""
+    icc = imagecodecs.cms_profile("gray", gamma=563/256)
+    params, workingSpace = ColorSpace.fromGrayICC(icc)
+    assert params.transfer == ("ICC", icc)
     assert workingSpace.toXYZ is None
-
-
-def grayProfileWithCurve(curve: bytes) -> bytes:
-    """Returns a minimal gray ICC profile with a kTRC tag.
-
-    Args:
-        curve: The kTRC tag data.
-
-    Returns:
-        The profile bytes.
-    """
-    offset = 128 + 4 + 12
-    table = struct.pack(">I", 1) + b"kTRC" + struct.pack(">II", offset, len(curve))
-    header = struct.pack(">I", offset + len(curve)) + bytes(12) + b"mntrGRAYXYZ " + bytes(128 - 28)
-    return header + table + curve + bytes(-len(curve) % 4)
-
-
-def test_lut_profile() -> None:
-    """A LUT based profile converts through LittleCMS to Rec.2020, and survives pickling."""
-    icc = lutSRGBProfile()
-    params, workingSpace = ColorSpace.fromLUTICC(icc)
-    assert params.icc == icc
-    assert params.lut is not None
-    assert params.transfer == ("Gamma", ColorSpace.LUT_GAMMA)
-    assert workingSpace == ColorSpace.named("ITU-R BT.2020")
-
-    restored = pickle.loads(pickle.dumps(params))
-    assert restored.lut is not None
-    assert restored == params
-    assert copy.deepcopy(params).lut is not None
-
-    # The 8-bit Rec.2020 intermediate loses precision in dark channels of saturated colors
-    rng = np.random.default_rng(1)
-    srgb = rng.integers(0, 256, size=(64, 64, 3), dtype=np.uint8)
-    linear = ColorSpace.linearize(img=srgb, params=restored, bgr=False)
-    encoded = ColorSpace.displayEncode(img=linear, workingSpace=workingSpace)
-    assert np.abs(encoded*255 - srgb).mean() < 1
-    gray = np.dstack([np.arange(256, dtype=np.uint8)[None]]*3)
-    linear = ColorSpace.linearize(img=gray, params=restored, bgr=False)
-    encoded = ColorSpace.displayEncode(img=linear, workingSpace=workingSpace)
-    assert np.abs(encoded*255 - gray).max() < 3
+    x = np.linspace(0, 1, 5)
+    assert np.allclose(ColorSpace.transferToLinear(x=x, transfer=params.transfer), x**(563/256), atol=1e-6)
 
 
 def test_displayEncode_srgb_and_untagged_apply_only_the_curve() -> None:
@@ -329,7 +199,7 @@ def test_displayEncode_converts_primaries_and_clips() -> None:
                           (15, ("BT.2020", None)),
                           (13, ("sRGB", None)),
                           (18, ("HLG", None)),
-                          (16, ("PQ", 203.0)),
+                          (16, ("PQ", None)),
                           (8, None),
                           (2, None),
                           (None, None),
@@ -376,7 +246,9 @@ def test_video_tags_jupiter() -> None:
                           (1, 2, 1, ColorSpace.DecodeParams(yuvMatrix="BT.709", range="limited"), ColorSpace.SRGB),
                           (2, 1, 2, ColorSpace.DecodeParams(transfer=("BT.709", None), yuvMatrix="BT.709", range="limited"),
                            ColorSpace.UNTAGGED),
-                          (9, 16, 9, ColorSpace.DecodeParams(transfer=("PQ", 203.0), yuvMatrix="BT.2020", range="limited"),
+                          (9, 16, 9, ColorSpace.DecodeParams(transfer=("PQ", None),
+                                                             yuvMatrix="BT.2020",
+                                                             range="limited"),
                            ColorSpace.named("ITU-R BT.2020"))])
 def test_video_tags_fall_back_independently(primaries: int,
                                             transfer: int,
@@ -405,7 +277,7 @@ def test_video_tags_rgb_and_gray() -> None:
 @pytest.mark.parametrize("chunks, expectedTransfer, expectedSpace",
                          [([(b"cICP", bytes([1, 13, 0, 1])), (b"iCCP", b"x\0\0"), (b"sRGB", b"\0")],
                            ("sRGB", None), ColorSpace.SRGB),
-                          ([(b"cICP", bytes([9, 16, 0, 1])), (b"sRGB", b"\0")], ("PQ", 203.0),
+                          ([(b"cICP", bytes([9, 16, 0, 1])), (b"sRGB", b"\0")], ("PQ", None),
                            ColorSpace.named("ITU-R BT.2020")),
                           ([(b"sRGB", b"\0"), (b"gAMA", struct.pack(">I", 100000))], ("sRGB", None), ColorSpace.SRGB),
                           ([(b"gAMA", struct.pack(">I", 45455))], ("sRGB", None), ColorSpace.SRGB),
@@ -429,7 +301,6 @@ def test_png_iccp_over_srgb() -> None:
     """An iCCP chunk wins over an sRGB chunk."""
     iccp = b"P3\0\0" + zlib.compress(p3Profile())
     params, workingSpace = ColorSpace.fromPNGChunks(chunks=[(b"sRGB", b"\0"), (b"iCCP", iccp)], channels=3)
-    assert params.transfer[0] == "ICC"
     assert np.allclose(workingSpace.toXYZ, ColorSpace.named("Display P3").toXYZ, atol=2e-4)
 
 
@@ -449,25 +320,13 @@ def test_png_gama_100000_equals_untagged() -> None:
                           ColorSpace.linearize(img=img, params=ColorSpace.DecodeParams()))
 
 
-def test_applyLevels() -> None:
-    """Sensor levels scale per channel and stay unclipped, negative below black."""
-    img = np.array([[[1000, 2000, 3000], [16383, 16383, 16383]]], dtype=np.uint16)
-    levels = ColorSpace.applyLevels(img=img, blackLevel=(1000.0, 1008.0, 1016.0), whiteLevel=16383.0)
-    assert levels.dtype == np.float32
-    assert levels[0, 0] == pytest.approx([0.0, 992/15375, 1984/15367])
-    assert levels[0, 1] == pytest.approx([1.0, 1.0, 1.0])
-    below = ColorSpace.applyLevels(img=np.array([[[990, 1000, 1010]]], dtype=np.uint16),
-                                   blackLevel=(1000.0, 1000.0, 1000.0),
-                                   whiteLevel=2000.0)
-    assert below[0, 0] == pytest.approx([-0.01, 0.0, 0.01])
-
-
-def test_applyLevels_bgr() -> None:
-    """Black levels are given in RGB order and applied reversed to BGR images."""
-    img = np.array([[[100, 100, 100]]], dtype=np.uint16)
-    rgb = ColorSpace.applyLevels(img=img, blackLevel=(0.0, 50.0, 90.0), whiteLevel=1000.0)
-    bgr = ColorSpace.applyLevels(img=img, blackLevel=(0.0, 50.0, 90.0), whiteLevel=1000.0, bgr=True)
-    assert rgb[0, 0] == pytest.approx(bgr[0, 0, ::-1])
+def test_linearize_sensor_data_keeps_black() -> None:
+    """Sensor data is scaled by its white level and keeps its black level, which Process subtracts."""
+    img = np.array([[[1000, 2000, 16383]]], dtype=np.uint16)
+    params = ColorSpace.DecodeParams(blackLevel=(1000.0, 1008.0, 1016.0), whiteLevel=16383.0)
+    linear = ColorSpace.linearize(img=img, params=params)
+    assert linear.dtype == np.float32
+    assert linear[0, 0] == pytest.approx([1000/16383, 2000/16383, 1.0])
 
 
 @pytest.mark.parametrize("header, dtype, expectedWhite",
@@ -478,9 +337,9 @@ def test_applyLevels_bgr() -> None:
                           ({}, np.uint8, 255.0),
                           ({}, np.int32, 2147483647.0)])
 def test_fits_levels(header: dict, dtype: type, expectedWhite: float) -> None:
-    """FITS white comes from DATAMAX or SATURATE when present, else the integer type's maximum; black is 0."""
+    """FITS white comes from DATAMAX or SATURATE when present, else the integer type's maximum; no black is stated."""
     params = ColorSpace.fromFITS(header=header, data=np.zeros((4, 4), dtype=dtype))
-    assert params.blackLevel == (0.0, 0.0, 0.0)
+    assert params.blackLevel is None
     assert params.whiteLevel == expectedWhite
     assert params.bayerPattern is None
 
@@ -565,7 +424,7 @@ def test_srgb_png_chunks() -> None:
     assert chunks[b"iCCP"].startswith(b"sRGB\0\0")
     params, workingSpace = ColorSpace.fromPNGChunks(chunks=ColorSpace.srgbPNGChunks(), channels=3)
     assert params.transfer == ("sRGB", None)
-    assert workingSpace is ColorSpace.SRGB
+    assert workingSpace == ColorSpace.SRGB
 
 
 @pytest.mark.parametrize("bits, colorRange, black, white",

@@ -341,6 +341,20 @@ def compareOutputToReference(context: Context, outputFile: str, referenceFile: s
         os.path.join(TEST_REFERENCES_PATH, referenceFile),
     )
 
+@then(u'output "{outputFile}" and reference "{referenceFile}" should be equal within "{maxDiff}" where flat')
+def compareOutputToFlatReference(context: Context, outputFile: str, referenceFile: str, maxDiff: str) -> None:
+    """Asserts that an output file matches a reference within a tolerance, away from the reference's edges.
+
+    4:2:0 video shares chroma between neighboring pixels, so pixels within 2 of an edge in the reference are left out.
+    """
+    output = cv2.imread(os.path.join(context.testOutputs, outputFile), cv2.IMREAD_UNCHANGED)
+    reference = cv2.imread(os.path.join(TEST_REFERENCES_PATH, referenceFile), cv2.IMREAD_UNCHANGED)
+    assert output.shape == reference.shape, f"'{outputFile}' {output.shape} and '{referenceFile}' {reference.shape} differ in shape"
+    kernel = np.ones((5, 5), dtype=np.uint8)
+    flat = np.all(cv2.dilate(reference, kernel) == cv2.erode(reference, kernel), axis=2)
+    diff = cv2.absdiff(output, reference)[flat].max()
+    assert diff <= float(maxDiff), f"'{outputFile}' and '{referenceFile}' differ by up to {diff}"
+
 def assertLinearEqual(file1: str, file2: str, maxDiff: float) -> None:
     """Asserts that two image files decode to the same linear values, compared as display-encoded sRGB.
 
@@ -371,7 +385,14 @@ def compareLinearOutputToInput(context: Context, outputFile: str, inputFile: str
 
 @given(u'I choose saved file "{file}" from "{dialog}"')
 def chooseSavedFile(context: Context, file: str, dialog: str) -> None:
-    chooseFile(path=os.path.join(context.testOutputs, file), dialog=dialog)
+    path = os.path.join(context.testOutputs, file)
+    window = waitForDialog(dialog)
+    def select():
+        window.select_filename(path)
+    def selected():
+        return path in window.get_filenames()
+    assert idle_add_delay(select, until=selected), f"Timed out selecting {path}"
+    confirmDialog(window)
 
 @step(u'I cancel "{dialog}"')
 def cancelDialog(context: Context, dialog: str) -> None:
@@ -401,31 +422,6 @@ def errorDialogShows(context: Context, text: str) -> None:
     idle_add_delay(update)
     assert text in message[0], f"The error dialog shows '{message[0]}'"
 
-@then(u'output "{file1}" and output "{file2}" should be equal within "{maxDiff}"')
-def compareOutputs(context: Context, file1: str, file2: str, maxDiff: str) -> None:
-    """Asserts that two output files have the same shape and pixels within a tolerance."""
-    img1 = cv2.imread(os.path.join(context.testOutputs, file1), cv2.IMREAD_UNCHANGED)
-    img2 = cv2.imread(os.path.join(context.testOutputs, file2), cv2.IMREAD_UNCHANGED)
-    assert img1 is not None and img2 is not None, f"'{file1}' or '{file2}' could not be read"
-    assert img1.shape == img2.shape, f"'{file1}' {img1.shape} and '{file2}' {img2.shape} differ in shape"
-    diff = cv2.absdiff(img1, img2).max()
-    assert diff <= float(maxDiff), f"'{file1}' and '{file2}' differ by up to {diff}"
-
-@then(u'output "{file1}" and output "{file2}" should be equal within "{maxMean}" on average')
-def compareOutputsOnAverage(context: Context, file1: str, file2: str, maxMean: str) -> None:
-    """Asserts that two output files have the same shape and a mean absolute difference within a tolerance."""
-    img1 = cv2.imread(os.path.join(context.testOutputs, file1), cv2.IMREAD_UNCHANGED)
-    img2 = cv2.imread(os.path.join(context.testOutputs, file2), cv2.IMREAD_UNCHANGED)
-    assert img1.shape == img2.shape, f"'{file1}' {img1.shape} and '{file2}' {img2.shape} differ in shape"
-    mean = cv2.absdiff(img1, img2).mean()
-    assert mean <= float(maxMean), f"'{file1}' and '{file2}' differ by {mean:.2f} on average"
-
-@then(u'output "{file1}" and output "{file2}" should differ')
-def outputsDiffer(context: Context, file1: str, file2: str) -> None:
-    img1 = cv2.imread(os.path.join(context.testOutputs, file1), cv2.IMREAD_UNCHANGED)
-    img2 = cv2.imread(os.path.join(context.testOutputs, file2), cv2.IMREAD_UNCHANGED)
-    assert img1.shape != img2.shape or cv2.absdiff(img1, img2).max() > 8, f"'{file1}' and '{file2}' are equal"
-
 @then(u'output "{file}" at "{x},{y}" should be about "{r},{g},{b}" within "{tolerance}"')
 def outputPixel(context: Context, file: str, x: str, y: str, r: str, g: str, b: str, tolerance: str) -> None:
     """Asserts the 8-bit RGB value of an output pixel."""
@@ -450,7 +446,7 @@ def isSRGBProfile(icc: bytes | None) -> bool:
     if(not icc or not ColorSpace.isMatrixProfile(icc)):
         return False
     params, workingSpace = ColorSpace.fromICC(icc)
-    return params.transfer == ("sRGB", None) and workingSpace is ColorSpace.SRGB
+    return params.transfer == ("sRGB", None) and workingSpace == ColorSpace.SRGB
 
 @then(u'output "{file}" should be tagged as sRGB')
 def outputTaggedSRGB(context: Context, file: str) -> None:

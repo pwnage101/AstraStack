@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cache
 from typing import Literal
 from lazy import lazy
@@ -7,6 +7,7 @@ np = lazy("numpy")
 colour = lazy("colour")
 Image = lazy("PIL.Image")
 ImageCms = lazy("PIL.ImageCms")
+imagecodecs = lazy("imagecodecs")
 import io
 import struct
 import warnings
@@ -15,16 +16,10 @@ import zlib
 # colour-science warns on import that its optional plotting features are missing
 warnings.filterwarnings("ignore", message='"Matplotlib" related API features are not available')
 
-IccCurve = (
-    tuple[Literal["gamma"], float]  # ("gamma", 2.2)
-    | tuple[Literal["table"], tuple[int, ...]]  # ("table", (0, 20, 40, ..., 65535))
-    | tuple[Literal["para"], int, tuple[float, ...]]  # ("para", 3, (2.4, 0.948, 0.052, 0.077, 0.04045))
-)
 Transfer = (
-    tuple[Literal["sRGB", "BT.709", "BT.601", "BT.2020", "HLG"], None]  # ("sRGB", None)
+    tuple[Literal["sRGB", "BT.709", "BT.601", "BT.2020", "PQ", "HLG"], None]  # ("sRGB", None)
     | tuple[Literal["Gamma"], float]  # ("Gamma", 2.2)
-    | tuple[Literal["PQ"], float]  # ("PQ", 203.0): cd/m² mapped to 1.0
-    | tuple[Literal["ICC"], tuple[IccCurve, IccCurve, IccCurve]]  # ("ICC", (rTRC, gTRC, bTRC))
+    | tuple[Literal["ICC"], bytes]  # ("ICC", profile bytes), a matrix/TRC RGB or gray TRC profile
 )
 BayerPattern = Literal["RGGB", "GRBG", "GBRG", "BGGR"]
 
@@ -33,11 +28,8 @@ D65 = (0.3127, 0.3290)
 D65_XYZ = (0.9504559270516716, 1.0, 1.0890577507598784)
 D50_XYZ = (0.9642, 1.0, 0.8249)
 
-# BT.2408 reference white for PQ (cd/m²)
-PQ_REFERENCE_WHITE = 203.0
-
-# Gamma of the 8-bit Rec.2020 intermediate that LUT based ICC profiles are converted to (u8Fixed8 of 2.2)
-LUT_GAMMA = 563/256
+# Adobe RGB (1998)'s gamma, 2 51/256, which cameras signal with the DCF Interoperability Index "R03"
+ADOBE_RGB_GAMMA = 563/256
 
 # CICP (ITU-T H.273) color primaries, as colour-science color space names
 CICP_PRIMARIES = {1: "ITU-R BT.709",
@@ -56,7 +48,7 @@ CICP_TRANSFERS = {1: ("BT.709", None),
                   13: ("sRGB", None),
                   14: ("BT.2020", None),
                   15: ("BT.2020", None),
-                  16: ("PQ", PQ_REFERENCE_WHITE),
+                  16: ("PQ", None),
                   18: ("HLG", None)}
 CICP_TRANSFER_LINEAR = 8
 
@@ -90,30 +82,13 @@ class ColorWarning(UserWarning):
 class DecodeParams:
     """What the loader needs to turn stored values into linear 0-1 working data."""
     transfer: Transfer | None = None  # ("sRGB", None)
-    icc: bytes | None = field(default=None, repr=False)  # b"\x00\x00\x0b\xc8lcms..." (LUT-based profiles only)
-    lut: ImageCms.ImageCmsTransform | None = field(default=None, repr=False, compare=False)  # rebuilt from icc
     yuvMatrix: Literal["BT.601", "BT.709", "BT.2020"] | None = None  # "BT.709"
     range: Literal["limited", "full"] | None = None  # "limited"
     bayerPattern: BayerPattern | None = None  # "RGGB"
-    blackLevel: tuple[float, ...] | None = None  # (1008.0, 1008.0, 1008.0), one per output channel (RGB)
+    # (1008.0, 1008.0, 1008.0), one per output channel (RGB), as the file states it; the Process black level
+    # subtracts it, not the loader
+    blackLevel: tuple[float, ...] | None = None
     whiteLevel: float | None = None  # 16383.0
-
-    def __getstate__(self) -> dict:
-        """Returns the state to pickle, without the LittleCMS transform, which can't be pickled."""
-        state = self.__dict__.copy()
-        state["lut"] = None
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        """Restores the pickled state and rebuilds the LittleCMS transform from the profile.
-
-        Args:
-            state: The state from __getstate__.
-        """
-        for name, value in state.items():
-            object.__setattr__(self, name, value)
-        if(self.icc is not None):
-            object.__setattr__(self, "lut", lutTransform(self.icc))
 
 
 @dataclass(frozen=True, eq=False)
@@ -135,15 +110,21 @@ class WorkingSpace:
             return NotImplemented
         if(self.toXYZ is None or other.toXYZ is None):
             return self.toXYZ is None and other.toXYZ is None
-        return bool(np.allclose(self.toXYZ, other.toXYZ, atol=1e-4))
+        return bool(np.allclose(a=self.toXYZ, b=other.toXYZ, atol=1e-4))
 
     __hash__ = None
 
 
 UNTAGGED = WorkingSpace(toXYZ=None)
-SRGB = WorkingSpace(toXYZ=np.array([[0.4123907992659595, 0.3575843393838780, 0.1804807884018343],
-                                    [0.2126390058715104, 0.7151686787677559, 0.0721923153607337],
-                                    [0.0193308187155918, 0.1191947797946259, 0.9505321522496608]]))
+SRGB = WorkingSpace(
+    toXYZ=np.array(
+        [
+            [0.4123907992659595, 0.3575843393838780, 0.1804807884018343],
+            [0.2126390058715104, 0.7151686787677559, 0.0721923153607337],
+            [0.0193308187155918, 0.1191947797946259, 0.9505321522496608],
+        ],
+    ),
+)
 
 
 def bradford(src: np.ndarray | tuple, dst: np.ndarray | tuple) -> np.ndarray:
@@ -156,9 +137,11 @@ def bradford(src: np.ndarray | tuple, dst: np.ndarray | tuple) -> np.ndarray:
     Returns:
         The 3×3 matrix converting XYZ under src to XYZ under dst.
     """
-    return colour.adaptation.matrix_chromatic_adaptation_VonKries(XYZ_w=np.asarray(src, dtype=np.float64),
-                                                                    XYZ_wr=np.asarray(dst, dtype=np.float64),
-                                                                    transform="Bradford")
+    return colour.adaptation.matrix_chromatic_adaptation_VonKries(
+        XYZ_w=np.asarray(src, dtype=np.float64),
+        XYZ_wr=np.asarray(dst, dtype=np.float64),
+        transform="Bradford",
+    )
 
 
 def toD65(toXYZ: np.ndarray, white: np.ndarray | tuple) -> WorkingSpace:
@@ -209,6 +192,32 @@ def named(name: str) -> WorkingSpace:
 
 REC2020_NAME = "ITU-R BT.2020"
 
+# colour-science's name for each named curve. Every curve is undone as a camera curve (OETF), to scene light.
+NAMED_TRANSFERS = {"sRGB": "ITU-T H.273 IEC 61966-2",
+                   "BT.709": "ITU-R BT.709",
+                   "BT.601": "ITU-R BT.601",
+                   "BT.2020": "ITU-R BT.2020",
+                   "HLG": "ITU-R BT.2100 HLG",
+                   "PQ": "ITU-R BT.2100 PQ"}
+
+
+@cache
+def referenceWhite(name: str) -> float:
+    """Returns the scene light of a named curve's reference white, which is decoded to 1.0.
+
+    Args:
+        name: The curve, a key of NAMED_TRANSFERS.
+
+    Returns:
+        For PQ and HLG, BT.2408's: the scene light that PQ shows at 203 cd/m², or that HLG encodes as 75% signal.
+        For the SDR curves, 1.0, the scene light of full signal.
+    """
+    if(name == "PQ"):
+        return float(colour.oetf_inverse(colour.eotf_inverse(203, function="ST 2084"), function=NAMED_TRANSFERS[name]))
+    elif(name == "HLG"):
+        return float(colour.oetf_inverse(0.75, function=NAMED_TRANSFERS[name]))
+    return 1.0
+
 
 def transferToLinear(x: np.ndarray, transfer: Transfer | None, bgr: bool = False) -> np.ndarray:
     """Converts encoded values (0-1) to linear values.
@@ -225,61 +234,18 @@ def transferToLinear(x: np.ndarray, transfer: Transfer | None, bgr: bool = False
     if(transfer is None):
         return x
     name, params = transfer
-    if(name == "sRGB"):
-        y = colour.models.eotf_sRGB(x)
-    elif(name == "BT.709"):
-        y = colour.models.oetf_inverse_BT709(x)
-    elif(name == "BT.601"):
-        y = colour.models.oetf_inverse_BT601(x)
-    elif(name == "BT.2020"):
-        y = colour.models.oetf_inverse_BT2020(x)
-    elif(name == "HLG"):
-        with np.errstate(invalid="ignore", divide="ignore"):
-            y = colour.models.oetf_inverse_BT2100_HLG(np.maximum(x, 0))
-    elif(name == "PQ"):
-        y = colour.models.eotf_ST2084(np.maximum(x, 0))/params
-    elif(name == "Gamma"):
+    if(name == "Gamma"):
         y = colour.gamma_function(a=x, exponent=params, negative_number_handling="Mirror")
     elif(name == "ICC"):
-        curves = params[::-1] if bgr else params
-        y = np.stack([curveToLinear(curve=curve, x=x[..., i]) for i, curve in enumerate(curves)], axis=-1)
+        y = iccToLinear(x=x[..., ::-1] if bgr else x, icc=params)
+        y = y[..., ::-1] if bgr else y
     else:
-        raise ValueError("Unknown transfer function " + repr(name))
-    return np.asarray(y).astype(dtype)
-
-
-def linearToTransfer(y: np.ndarray, transfer: Transfer | None) -> np.ndarray:
-    """Encodes linear values with a transfer function, the inverse of transferToLinear.
-
-    Args:
-        y: Linear values.
-        transfer: The curve to apply, None for no curve. ICC curves are not supported.
-
-    Returns:
-        The encoded values, same dtype as y.
-    """
-    dtype = y.dtype
-    if(transfer is None):
-        return y
-    name, params = transfer
-    if(name == "sRGB"):
-        x = colour.models.eotf_inverse_sRGB(y)
-    elif(name == "BT.709"):
-        x = colour.models.oetf_BT709(y)
-    elif(name == "BT.601"):
-        x = colour.models.oetf_BT601(y)
-    elif(name == "BT.2020"):
-        x = colour.models.oetf_BT2020(y)
-    elif(name == "HLG"):
         with np.errstate(invalid="ignore", divide="ignore"):
-            x = colour.models.oetf_BT2100_HLG(np.maximum(y, 0))
-    elif(name == "PQ"):
-        x = colour.models.eotf_inverse_ST2084(np.maximum(y, 0)*params)
-    elif(name == "Gamma"):
-        x = colour.gamma_function(a=y, exponent=1/params, negative_number_handling="Mirror")
-    else:
-        raise ValueError("Can't encode with transfer function " + repr(name))
-    return np.asarray(x).astype(dtype)
+            y = colour.oetf_inverse(np.maximum(x, 0), function=NAMED_TRANSFERS[name])
+            # Normalize so that "paper white" level is always 1.0 in working linear space.
+            # Yes, that means some values in linear space are higher than 1.0.
+            y = y/referenceWhite(name)
+    return np.asarray(y).astype(dtype)
 
 
 def linearizeInteger(img: np.ndarray, transfer: Transfer | None, bgr: bool = False) -> np.ndarray:
@@ -294,7 +260,7 @@ def linearizeInteger(img: np.ndarray, transfer: Transfer | None, bgr: bool = Fal
         The linear float32 image.
     """
     n = np.iinfo(img.dtype).max + 1
-    key = (repr(transfer), n)
+    key = (transfer, n)
     if(key not in LUTS):
         codes = np.arange(n, dtype=np.float64)/(n - 1)
         if(transfer is not None and transfer[0] == "ICC"):
@@ -311,26 +277,6 @@ def linearizeInteger(img: np.ndarray, transfer: Transfer | None, bgr: bool = Fal
     return np.dstack([lut[i][img[:, :, i]] for i in range(3)])
 
 
-def applyLevels(img: np.ndarray, blackLevel: tuple[float, ...], whiteLevel: float, bgr: bool = False) -> np.ndarray:
-    """Scales sensor data to 0-1 with its black and white levels, unclipped.
-
-    Args:
-        img: Sensor data in stored units, gray or with 3 channels.
-        blackLevel: Black level of each channel (RGB order), in stored units.
-        whiteLevel: White (saturation) level, in stored units.
-        bgr: Whether the channels are in BGR order.
-
-    Returns:
-        (value - black)/(white - black) per channel as float32, negative below black.
-    """
-    black = np.asarray(blackLevel, dtype=np.float32)
-    if(img.ndim == 2):
-        black = black.mean()
-    elif(bgr):
-        black = black[::-1]
-    return ((img.astype(np.float32) - black)/(np.float32(whiteLevel) - black)).astype(np.float32)
-
-
 def linearize(img: np.ndarray, params: DecodeParams, bgr: bool = True) -> np.ndarray:
     """Converts stored image values to linear 0-1 working data.
 
@@ -340,12 +286,10 @@ def linearize(img: np.ndarray, params: DecodeParams, bgr: bool = True) -> np.nda
         bgr: Whether the channels are in BGR order.
 
     Returns:
-        The linear float32 image.
+        The linear float32 image. Sensor data is scaled by its white level and keeps its black level.
     """
-    if(params.lut is not None and img.ndim == 3):
-        img = applyLUT(img=img, transform=params.lut, bgr=bgr)
     if(params.whiteLevel is not None):
-        return applyLevels(img=img, blackLevel=params.blackLevel, whiteLevel=params.whiteLevel, bgr=bgr)
+        return (img.astype(np.float32)/np.float32(params.whiteLevel)).astype(np.float32)
     if(np.issubdtype(img.dtype, np.floating)):
         return transferToLinear(x=img.astype(np.float32), transfer=params.transfer, bgr=bgr)
     return linearizeInteger(img=img, transfer=params.transfer, bgr=bgr)
@@ -393,7 +337,7 @@ def displayEncode(img: np.ndarray, workingSpace: WorkingSpace | None) -> np.ndar
     """
     if(img.ndim == 3):
         img = toSRGBPrimaries(img=img, workingSpace=workingSpace)
-    img = np.clip(img, 0, 1).astype(np.float32)
+    img = np.clip(a=img, a_min=0, a_max=1).astype(np.float32)
     return colour.models.eotf_inverse_sRGB(img).astype(np.float32)
 
 
@@ -408,8 +352,8 @@ def quantize(img: np.ndarray, bits: int = 8) -> np.ndarray:
         The uint8 or uint16 image.
     """
     if(bits == 16):
-        return np.around(np.clip(img, 0, 1)*65535).astype(np.uint16)
-    return np.around(np.clip(img, 0, 1)*255).astype(np.uint8)
+        return np.around(np.clip(a=img, a_min=0, a_max=1)*65535).astype(np.uint16)
+    return np.around(np.clip(a=img, a_min=0, a_max=1)*255).astype(np.uint8)
 
 
 def displayImage(img: np.ndarray, workingSpace: WorkingSpace | None, bits: int = 8) -> np.ndarray:
@@ -426,95 +370,65 @@ def displayImage(img: np.ndarray, workingSpace: WorkingSpace | None, bits: int =
     return quantize(img=displayEncode(img=img, workingSpace=workingSpace), bits=bits)
 
 
-def curveToLinear(curve: IccCurve, x: np.ndarray) -> np.ndarray:
-    """Converts values through an ICC tone curve.
-
-    Args:
-        curve: The ICC curve.
-        x: Encoded values (0-1).
-
-    Returns:
-        The linear values.
-    """
-    if(curve[0] == "gamma"):
-        return colour.gamma_function(a=x, exponent=curve[1], negative_number_handling="Mirror")
-    elif(curve[0] == "table"):
-        table = np.array(curve[1], dtype=np.float64)/65535
-        return np.interp(x, np.linspace(0, 1, len(table)), table)
-    elif(curve[0] == "para"):
-        # All parametric curve types as type 4: Y = (aX + b)^g + e for X >= d, else cX + f
-        functionType, p = curve[1], curve[2]
-        if(functionType == 0):
-            g, a, b, c, d, e, f = p[0], 1, 0, 0, 0, 0, 0
-        elif(functionType == 1):
-            g, a, b, c, d, e, f = p[0], p[1], p[2], 0, -p[2]/p[1], 0, 0
-        elif(functionType == 2):
-            g, a, b, c, d, e, f = p[0], p[1], p[2], 0, -p[2]/p[1], p[3], p[3]
-        elif(functionType == 3):
-            g, a, b, c, d, e, f = p[0], p[1], p[2], p[3], p[4], 0, 0
-        else:
-            g, a, b, c, d, e, f = p
-        return np.where(x >= d, np.maximum(a*x + b, 0)**g + e, c*x + f)
-    raise ValueError("Unknown ICC curve " + repr(curve[0]))
-
-
-def iccTags(icc: bytes) -> dict[str, bytes]:
-    """Returns the tags of an ICC profile.
+def iccProfile(icc: bytes) -> ImageCms.core.CmsProfile:
+    """Opens an ICC profile with LittleCMS.
 
     Args:
         icc: The profile bytes.
 
     Returns:
-        The tag data by signature.
+        The profile.
     """
-    tags = {}
-    count = struct.unpack(">I", icc[128:132])[0]
-    for i in range(count):
-        signature, offset, size = struct.unpack(">4sII", icc[132 + i*12:144 + i*12])
-        tags[signature.decode("latin-1")] = icc[offset:offset + size]
-    return tags
+    return ImageCms.ImageCmsProfile(io.BytesIO(icc)).profile
 
 
-def readS15Fixed16(data: bytes) -> np.ndarray:
-    """Returns the ICC s15Fixed16 numbers in the data.
+@cache
+def linearProfile(icc: bytes) -> bytes:
+    """Returns a profile with a matrix/TRC RGB profile's colorants but linear curves, or a linear gray profile.
 
     Args:
-        data: Big-endian s15Fixed16 values.
+        icc: The profile bytes.
 
     Returns:
-        The numbers as float64.
+        The linear profile's bytes.
     """
-    return np.array(struct.unpack(">" + str(len(data)//4) + "i", data))/65536
+    profile = iccProfile(icc)
+    if(profile.xcolor_space == "GRAY"):
+        return imagecodecs.cms_profile("gray", gamma=1.0)
+    # Colorants are D50-adapted, so giving their xyY with the D50 white keeps them exactly.
+    primaries = [v for xyY in (profile.red_primary, profile.green_primary, profile.blue_primary) for v in xyY[1]]
+    return imagecodecs.cms_profile(
+        "rgb",
+        whitepoint=[*colour.XYZ_to_xyY(np.array(D50_XYZ))],
+        primaries=primaries,
+        gamma=1.0,
+    )
 
 
-def iccCurve(tag: bytes) -> IccCurve:
-    """Returns the tone curve of an ICC curv or para tag.
+def iccToLinear(x: np.ndarray, icc: bytes) -> np.ndarray:
+    """Converts encoded values (0-1) through an ICC profile's tone curves, with LittleCMS.
 
     Args:
-        tag: The tag data.
+        x: Encoded values; RGB profiles need the channels (RGB order) on the last axis.
+        icc: A matrix/TRC RGB or gray TRC profile's bytes.
 
     Returns:
-        The curve.
-
-    Raises:
-        ValueError: The tag isn't a curv or para tag.
+        The linear values, in the profile's own primaries.
     """
-    if(tag[:4] == b"curv"):
-        count = struct.unpack(">I", tag[8:12])[0]
-        if(count == 0):
-            return ("gamma", 1.0)
-        elif(count == 1):
-            return ("gamma", struct.unpack(">H", tag[12:14])[0]/256)
-        return ("table", struct.unpack(">" + str(count) + "H", tag[12:12 + count*2]))
-    elif(tag[:4] == b"para"):
-        functionType = struct.unpack(">H", tag[8:10])[0]
-        count = [1, 3, 4, 5, 7][functionType]
-        return ("para", functionType, tuple(float(v) for v in readS15Fixed16(tag[12:12 + count*4])))
-    raise ValueError("Unsupported ICC curve type")
+    gray = iccProfile(icc).xcolor_space == "GRAY"
+    colorspace = "gray" if gray else "rgb"
+    y = imagecodecs.cms_transform(
+        x.reshape((1, -1) if gray else (1, -1, 3)),
+        profile=icc,
+        outprofile=linearProfile(icc),
+        colorspace=colorspace,
+        outcolorspace=colorspace,
+    )
+    return y.reshape(x.shape)
 
 
 def isMatrixProfile(icc: bytes) -> bool:
-    """Returns whether an ICC profile is a matrix/TRC RGB profile (no LUTs).
+    """Returns whether an ICC profile is a matrix/TRC RGB profile; any LUTs it also has are ignored.
 
     Args:
         icc: The profile bytes.
@@ -522,10 +436,8 @@ def isMatrixProfile(icc: bytes) -> bool:
     Returns:
         True for a matrix/TRC RGB profile.
     """
-    tags = iccTags(icc)
-    return (icc[16:20] == b"RGB " and
-            "A2B0" not in tags and
-            all(t in tags for t in ("rXYZ", "gXYZ", "bXYZ", "rTRC", "gTRC", "bTRC")))
+    profile = iccProfile(icc)
+    return profile.xcolor_space == "RGB " and profile.is_matrix_shaper
 
 
 def isGrayProfile(icc: bytes) -> bool:
@@ -537,7 +449,8 @@ def isGrayProfile(icc: bytes) -> bool:
     Returns:
         True for a gray TRC profile.
     """
-    return icc[16:20] == b"GRAY" and "kTRC" in iccTags(icc)
+    profile = iccProfile(icc)
+    return profile.xcolor_space == "GRAY" and profile.is_matrix_shaper
 
 
 def fromGrayICC(icc: bytes) -> tuple[DecodeParams, WorkingSpace]:
@@ -549,8 +462,7 @@ def fromGrayICC(icc: bytes) -> tuple[DecodeParams, WorkingSpace]:
     Returns:
         The decode parameters and working space.
     """
-    curve = iccCurve(iccTags(icc)["kTRC"])
-    return (DecodeParams(transfer=("ICC", (curve, curve, curve))), UNTAGGED)
+    return (DecodeParams(transfer=("ICC", icc)), UNTAGGED)
 
 
 def fromICC(icc: bytes) -> tuple[DecodeParams, WorkingSpace]:
@@ -564,113 +476,16 @@ def fromICC(icc: bytes) -> tuple[DecodeParams, WorkingSpace]:
     Returns:
         The decode parameters (the ICC curves, or the sRGB curve when they match it) and working space.
     """
-    tags = iccTags(icc)
-    colorants = np.column_stack([readS15Fixed16(tags[t][8:20]) for t in ("rXYZ", "gXYZ", "bXYZ")])
+    profile = iccProfile(icc)
+    colorants = np.column_stack([c[0] for c in (profile.red_colorant, profile.green_colorant, profile.blue_colorant)])
     workingSpace = toD65(toXYZ=colorants, white=D50_XYZ)
-    curves = tuple(iccCurve(tags[t]) for t in ("rTRC", "gTRC", "bTRC"))
-    x = np.linspace(0, 1, 4096)
-    if(all(np.abs(curveToLinear(curve=curve, x=x) - colour.models.eotf_sRGB(x)).max() < 1e-4 for curve in curves)):
+    x = np.linspace(start=0, stop=1, num=4096)
+    linear = iccToLinear(x=np.stack([x]*3, axis=-1), icc=icc)
+    if(np.abs(linear - colour.models.eotf_sRGB(x)[:, np.newaxis]).max() < 1e-4):
         transfer = ("sRGB", None)
     else:
-        transfer = ("ICC", curves)
-    if(workingSpace == SRGB):
-        workingSpace = SRGB
+        transfer = ("ICC", icc)
     return (DecodeParams(transfer=transfer), workingSpace)
-
-
-def matrixProfile(toXYZ: np.ndarray, description: str, gamma: float) -> bytes:
-    """Generates an ICC v2 matrix/TRC profile with a gamma tone curve.
-
-    Args:
-        toXYZ: RGB -> XYZ matrix whose (1, 1, 1) is D65.
-        description: Text of the desc tag.
-        gamma: Exponent of the tone curve.
-
-    Returns:
-        The profile bytes.
-    """
-    def s15Fixed16(values: np.ndarray) -> bytes:
-        return b"".join(struct.pack(">i", int(round(v*65536))) for v in values)
-
-    def xyzTag(XYZ: np.ndarray) -> bytes:
-        return b"XYZ " + bytes(4) + s15Fixed16(XYZ)
-
-    chad = bradford(D65_XYZ, D50_XYZ)
-    colorants = chad @ np.asarray(toXYZ)
-    ascii = description.encode("ascii") + b"\0"
-    curve = b"curv" + bytes(4) + struct.pack(">IH", 1, int(round(gamma*256)))
-    tags = [(b"desc", b"desc" + bytes(4) + struct.pack(">I", len(ascii)) + ascii + bytes(4 + 4 + 2 + 1 + 67)),
-            (b"cprt", b"text" + bytes(4) + b"No copyright, use freely\0"),
-            (b"wtpt", xyzTag(np.array(D50_XYZ))),
-            (b"chad", b"sf32" + bytes(4) + s15Fixed16(chad.flatten())),
-            (b"rXYZ", xyzTag(colorants[:, 0])),
-            (b"gXYZ", xyzTag(colorants[:, 1])),
-            (b"bXYZ", xyzTag(colorants[:, 2])),
-            (b"rTRC", curve),
-            (b"gTRC", curve),
-            (b"bTRC", curve)]
-    offset = 128 + 4 + 12*len(tags)
-    table = struct.pack(">I", len(tags))
-    data = b""
-    for signature, tag in tags:
-        table += signature + struct.pack(">II", offset + len(data), len(tag))
-        data += tag + bytes(-len(tag) % 4)
-    header = (struct.pack(">I", offset + len(data)) + bytes(4) + struct.pack(">I", 0x02100000) +
-              b"mntrRGB XYZ " + struct.pack(">6H", 2026, 1, 1, 0, 0, 0) + b"acsp" +
-              bytes(4 + 4 + 4 + 4 + 8 + 4) + s15Fixed16(np.array(D50_XYZ)) + bytes(4 + 16 + 28))
-    return header + table + data
-
-
-def lutTransform(icc: bytes) -> ImageCms.ImageCmsTransform:
-    """Builds the LittleCMS transform from a LUT based ICC profile to the LUT_GAMMA encoded Rec.2020 intermediate.
-
-    Args:
-        icc: The input profile bytes.
-
-    Returns:
-        The 8-bit RGB -> RGB transform.
-    """
-    target = matrixProfile(toXYZ=named(REC2020_NAME).toXYZ, description="Rec.2020", gamma=LUT_GAMMA)
-    return ImageCms.buildTransform(inputProfile=ImageCms.ImageCmsProfile(io.BytesIO(icc)),
-                                   outputProfile=ImageCms.ImageCmsProfile(io.BytesIO(target)),
-                                   inMode="RGB",
-                                   outMode="RGB",
-                                   renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC)
-
-
-def fromLUTICC(icc: bytes) -> tuple[DecodeParams, WorkingSpace]:
-    """Describes a LUT based RGB ICC profile, converted on load to linear Rec.2020.
-
-    Args:
-        icc: The profile bytes.
-
-    Returns:
-        The decode parameters (the profile, its transform and the intermediate's curve) and Rec.2020.
-    """
-    params = DecodeParams(transfer=("Gamma", LUT_GAMMA), icc=icc, lut=lutTransform(icc))
-    return (params, named(REC2020_NAME))
-
-
-def applyLUT(img: np.ndarray, transform: ImageCms.ImageCmsTransform, bgr: bool = True) -> np.ndarray:
-    """Converts an image through a LUT based profile's transform to the LUT_GAMMA encoded Rec.2020 intermediate.
-
-    LittleCMS in Pillow only converts 8-bit RGB, so 16-bit images are reduced to 8 bits first.
-
-    Args:
-        img: The 8/16-bit image with 3 channels.
-        transform: The transform from lutTransform.
-        bgr: Whether the channels are in BGR order.
-
-    Returns:
-        The converted uint8 image, in the same channel order.
-    """
-    if(np.issubdtype(img.dtype, np.floating)):
-        img = np.around(np.clip(img, 0, 1)*255).astype(np.uint8)
-    elif(img.dtype != np.uint8):
-        img = np.around(img.astype(np.float32)/np.iinfo(img.dtype).max*255).astype(np.uint8)
-    rgb = img[:, :, ::-1] if bgr else img
-    out = np.asarray(ImageCms.applyTransform(Image.fromarray(np.ascontiguousarray(rgb), "RGB"), transform))
-    return np.ascontiguousarray(out[:, :, ::-1] if bgr else out)
 
 
 def describeICC(icc: bytes, channels: int) -> tuple[DecodeParams, WorkingSpace] | None:
@@ -688,8 +503,6 @@ def describeICC(icc: bytes, channels: int) -> tuple[DecodeParams, WorkingSpace] 
             return fromGrayICC(icc)
         elif(isMatrixProfile(icc)):
             return fromICC(icc)
-        elif(icc[16:20] == b"RGB " and channels == 3):
-            return fromLUTICC(icc)
     except Exception as error:
         warnings.warn("Unsupported ICC profile, the image is treated as untagged: " + str(error), ColorWarning)
         return None
@@ -709,8 +522,10 @@ def cicpTransfer(code: int | None) -> Transfer | None:
     if(code in CICP_TRANSFERS):
         return CICP_TRANSFERS[code]
     if(code in CICP_UNSUPPORTED_TRANSFERS):
-        warnings.warn("Unsupported transfer characteristics " + CICP_UNSUPPORTED_TRANSFERS[code] +
-                      ", treated as untagged", ColorWarning)
+        warnings.warn(
+            message=f"Unsupported transfer characteristics {CICP_UNSUPPORTED_TRANSFERS[code]}, treated as untagged",
+            category=ColorWarning,
+        )
     return None
 
 
@@ -741,12 +556,14 @@ def fromCICP(primaries: int, transfer: int) -> tuple[DecodeParams, WorkingSpace]
     return (DecodeParams(transfer=cicpTransfer(transfer)), cicpPrimaries(primaries))
 
 
-def fromVideoTags(primaries: int | None,
-                  transfer: int | None,
-                  matrix: int | None,
-                  colorRange: int | None,
-                  isYUV: bool,
-                  fullRangeFormat: bool = False) -> tuple[DecodeParams, WorkingSpace]:
+def fromVideoTags(
+    primaries: int | None,
+    transfer: int | None,
+    matrix: int | None,
+    colorRange: int | None,
+    isYUV: bool,
+    fullRangeFormat: bool = False,
+) -> tuple[DecodeParams, WorkingSpace]:
     """Describes a video stream from its color tags, each tag falling back on its own when it is missing.
 
     Args:
@@ -780,10 +597,12 @@ YUV_WEIGHTS = {"BT.601": (0.299, 0.114),
                "BT.2020": (0.2627, 0.0593)}
 
 
-def yuvToRGB(yuv: np.ndarray,
-             bits: int,
-             matrix: Literal["BT.601", "BT.709", "BT.2020"],
-             colorRange: Literal["limited", "full"]) -> np.ndarray:
+def yuvToRGB(
+    yuv: np.ndarray,
+    bits: int,
+    matrix: Literal["BT.601", "BT.709", "BT.2020"],
+    colorRange: Literal["limited", "full"],
+) -> np.ndarray:
     """Converts 4:4:4 YUV to full range RGB, expanding limited range.
 
     Limited range Y 16-235 and Cb/Cr 16-240 (scaled for higher bit depths) become 0-1; values outside the nominal
@@ -813,7 +632,7 @@ def yuvToRGB(yuv: np.ndarray,
     r = y + 2*(1 - kr)*cr
     b = y + 2*(1 - kb)*cb
     g = (y - kr*r - kb*b)/(1 - kr - kb)
-    return np.clip(np.dstack([r, g, b]), 0, 1).astype(np.float32)
+    return np.clip(a=np.dstack([r, g, b]), a_min=0, a_max=1).astype(np.float32)
 
 
 def rawRGBCam(raw: object) -> np.ndarray | None:
@@ -857,11 +676,13 @@ def fromRAW(raw: object) -> tuple[DecodeParams, WorkingSpace]:
     return (params, WorkingSpace(toXYZ=SRGB.toXYZ @ rgbCam))
 
 
-def normalizeBayerPattern(pattern: str,
-                          xOffset: int = 0,
-                          yOffset: int = 0,
-                          bottomUp: bool = False,
-                          height: int = 0) -> BayerPattern | None:
+def normalizeBayerPattern(
+    pattern: str,
+    xOffset: int = 0,
+    yOffset: int = 0,
+    bottomUp: bool = False,
+    height: int = 0,
+) -> BayerPattern | None:
     """Normalizes a FITS Bayer pattern to the pattern at the first stored pixel.
 
     Args:
@@ -898,16 +719,18 @@ def fromFITS(header: object, data: np.ndarray) -> DecodeParams:
         data: The (first frame's) data.
 
     Returns:
-        The decode parameters: black 0; white from DATAMAX or SATURATE, else the integer type's maximum, else 1.0
-        for float data within 0-1 and 65535 otherwise.
+        The decode parameters: no black level, since FITS has no standard keyword for one; white from DATAMAX or
+        SATURATE, else the integer type's maximum, else 1.0 for float data within 0-1 and 65535 otherwise.
     """
     bayerPattern = None
     if("BAYERPAT" in header):
-        bayerPattern = normalizeBayerPattern(pattern=str(header["BAYERPAT"]),
-                                             xOffset=int(header.get("XBAYROFF", 0)),
-                                             yOffset=int(header.get("YBAYROFF", 0)),
-                                             bottomUp=str(header.get("ROWORDER", "")).strip().upper() == "BOTTOM-UP",
-                                             height=data.shape[0])
+        bayerPattern = normalizeBayerPattern(
+            pattern=str(header["BAYERPAT"]),
+            xOffset=int(header.get("XBAYROFF", 0)),
+            yOffset=int(header.get("YBAYROFF", 0)),
+            bottomUp=str(header.get("ROWORDER", "")).strip().upper() == "BOTTOM-UP",
+            height=data.shape[0],
+        )
     if("DATAMAX" in header and float(header["DATAMAX"]) > 0):
         white = float(header["DATAMAX"])
     elif("SATURATE" in header and float(header["SATURATE"]) > 0):
@@ -918,7 +741,7 @@ def fromFITS(header: object, data: np.ndarray) -> DecodeParams:
         white = 1.0
     else:
         white = 65535.0
-    return DecodeParams(bayerPattern=bayerPattern, blackLevel=(0.0, 0.0, 0.0), whiteLevel=white)
+    return DecodeParams(bayerPattern=bayerPattern, whiteLevel=white)
 
 
 def pngChunks(file: str) -> list[tuple[bytes, bytes]]:
@@ -970,14 +793,12 @@ def fromPNGChunks(chunks: list[tuple[bytes, bytes]], channels: int) -> tuple[Dec
         if(b"cHRM" in chunks):
             v = np.array(struct.unpack(">8I", chunks[b"cHRM"][:32]))/100000
             workingSpace = fromPrimaries(primaries=v[2:8].reshape(3, 2), white=v[0:2])
-            if(workingSpace == SRGB):
-                workingSpace = SRGB
         transfer = None
         if(b"gAMA" in chunks):
             gAMA = struct.unpack(">I", chunks[b"gAMA"][:4])[0]
             if(gAMA == 45455 and workingSpace.toXYZ is None):
                 return (DecodeParams(transfer=("sRGB", None)), SRGB)
-            elif(gAMA == 45455 and workingSpace is SRGB):
+            elif(gAMA == 45455 and workingSpace == SRGB):
                 transfer = ("sRGB", None)
             elif(gAMA != 100000 and gAMA > 0):
                 transfer = ("Gamma", 100000/gAMA)
@@ -1008,26 +829,28 @@ def readICC(file: str) -> bytes | None:
         return None
 
 
-def readEXIFColorSpace(file: str) -> int | None:
-    """Returns the EXIF ColorSpace tag of an image file.
+def readEXIFColorSpace(file: str) -> tuple[int | None, str | None]:
+    """Returns the EXIF ColorSpace tag and Interoperability Index of an image file.
 
     Args:
         file: Path of the file.
 
     Returns:
-        The tag's value (1 = sRGB), or None when there is none.
+        The tags' values (1 = sRGB; 0xFFFF with "R03" = Adobe RGB), each None when there is none.
     """
     try:
         with Image.open(file) as img:
-            return img.getexif().get_ifd(0x8769).get(0xA001)
+            exif = img.getexif()
+            return (exif.get_ifd(0x8769).get(0xA001), exif.get_ifd(0xA005).get(1))
     except Exception:
-        return None
+        return (None, None)
 
 
 def describeImage(file: str, channels: int) -> tuple[DecodeParams, WorkingSpace]:
     """Describes a (non RAW, non FITS) image file from its color tags.
 
-    PNG: cICP > iCCP > sRGB > cHRM/gAMA. JPEG/TIFF: an embedded ICC profile, then EXIF ColorSpace = 1 as sRGB.
+    PNG: cICP > iCCP > sRGB > cHRM/gAMA. JPEG/TIFF: an embedded ICC profile, then EXIF ColorSpace = 1 as sRGB, or
+    ColorSpace = 0xFFFF with Interoperability Index "R03" as Adobe RGB, which is how cameras mark it.
 
     Args:
         file: Path of the file.
@@ -1044,8 +867,12 @@ def describeImage(file: str, channels: int) -> tuple[DecodeParams, WorkingSpace]
         icc = readICC(file)
         if(icc):
             description = describeICC(icc=icc, channels=channels)
-        if(description is None and readEXIFColorSpace(file) == 1):
-            description = (DecodeParams(transfer=("sRGB", None)), SRGB)
+        if(description is None):
+            colorSpace, interopIndex = readEXIFColorSpace(file)
+            if(colorSpace == 1):
+                description = (DecodeParams(transfer=("sRGB", None)), SRGB)
+            elif(colorSpace == 0xFFFF and interopIndex == "R03"):
+                description = (DecodeParams(transfer=("Gamma", ADOBE_RGB_GAMMA)), named("Adobe RGB (1998)"))
     if(description is None):
         return (DecodeParams(), UNTAGGED)
     return description
@@ -1124,6 +951,6 @@ def saveSRGB(file: str, img: np.ndarray, workingSpace: WorkingSpace | None, bits
         tifffile = lazy("tifffile")
         tifffile.imwrite(file, data=rgb, photometric="rgb", iccprofile=srgbProfile())
     elif(extension in (".tif", ".tiff")):
-        Image.fromarray(rgb, "RGB").save(file, icc_profile=srgbProfile())
+        Image.fromarray(rgb, "RGB").save(fp=file, icc_profile=srgbProfile())
     else:
-        Image.fromarray(rgb, "RGB").save(file, quality=95, icc_profile=srgbProfile())
+        Image.fromarray(rgb, "RGB").save(fp=file, quality=95, icc_profile=srgbProfile())

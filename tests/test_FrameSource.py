@@ -9,6 +9,7 @@ import numpy as np
 
 from FrameSource import FrameSource, ImageSequenceSource, VideoSource
 from tests.inputs import (
+    AVI8_PAL8,
     DNG16_RGGB_SEQUENCE,
     DNG16_RGGB_SEQUENCE_DIMENSIONS,
     DROPPED_FRAMES_AVI,
@@ -146,6 +147,15 @@ class TestVideoSource(unittest.TestCase):
 
         assert source.readFrame(MP4_YUV8_FRAME_COUNT) is None
         assert VideoSource(MP4_YUV8).readFrame(MP4_YUV8_FRAME_COUNT) is None
+
+    def test_palette_video_after_seeks(self) -> None:
+        """A palette video's frames keep their palette when read after a seek, as OpenCV decodes them."""
+        capture = cv2.VideoCapture(AVI8_PAL8)
+        expectedFrames = [capture.read()[1].astype(np.uint16)*257 for _ in range(3)]
+        capture.release()
+        source = VideoSource(AVI8_PAL8)
+        for index in (2, 0, 1):
+            assert np.array_equal(source.readFrame(index).image, expectedFrames[index]), f"frame {index} is wrong"
 
     def test_pickles_without_capture(self) -> None:
         """An open source pickles as its path and timestamps, and the copy reads the same frames in any order."""

@@ -36,7 +36,7 @@
     </child>
   </object>
   <object class="GtkAdjustment" id="blackLevelAdjust">
-    <property name="upper">255</property>
+    <property name="upper">100</property>
     <property name="step-increment">1</property>
     <signal name="value-changed" handler="processImage" swapped="no"/>
   </object>
@@ -2775,13 +2775,29 @@ Note: Drift adjustment will still crop the image.</property>
                                             <property name="can-focus">True</property>
                                             <property name="margin-top">10</property>
                                             <property name="adjustment">blackLevelAdjust</property>
-                                            <property name="round-digits">0</property>
-                                            <property name="digits">0</property>
+                                            <property name="round-digits">3</property>
+                                            <property name="digits">1</property>
                                             <property name="value-pos">left</property>
                                             <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
                                           </object>
                                           <packing>
                                             <property name="left-attach">1</property>
+                                            <property name="top-attach">1</property>
+                                          </packing>
+                                        </child>
+                                        <child>
+                                          <object class="GtkCheckButton" id="autoBlackLevel">
+                                            <property name="label" translatable="yes">Auto</property>
+                                            <property name="visible">True</property>
+                                            <property name="can-focus">True</property>
+                                            <property name="receives-default">False</property>
+                                            <property name="tooltip-text" translatable="yes">Sets the black level to the one the file states, or else to an estimate from the image's darkest areas.</property>
+                                            <property name="margin-top">10</property>
+                                            <property name="draw-indicator">True</property>
+                                            <signal name="toggled" handler="setAutoBlackLevel" swapped="no"/>
+                                          </object>
+                                          <packing>
+                                            <property name="left-attach">2</property>
                                             <property name="top-attach">1</property>
                                           </packing>
                                         </child>

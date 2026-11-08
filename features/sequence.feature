@@ -36,8 +36,10 @@ Feature: Image Sequence
         And I wait until active tab is "Align"
         And I press "alignButton"
         And I wait until active tab is "Stack"
+        And I uncheck "autoCrop"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I check "autoBlackLevel"
         And I async press "saveButton"
         And I choose output file "dng16_rggb_sequence.png" from "saveDialog"
         Then output "dng16_rggb_sequence.png" and reference "dng16_rggb_sequence.png" should be equal
@@ -50,8 +52,10 @@ Feature: Image Sequence
         And I select "Bayer RGGB" from "colorMode"
         And I press "alignButton"
         And I wait until active tab is "Stack"
+        And I uncheck "autoCrop"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I check "autoBlackLevel"
         And I async press "saveButton"
         And I choose output file "fits16_rggb_sequence.png" from "saveDialog"
         Then output "fits16_rggb_sequence.png" and reference "fits16_rggb_sequence.png" should be equal

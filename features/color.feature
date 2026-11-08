@@ -1,145 +1,80 @@
 Feature: Color
 
-    Scenario Outline: Tagged encodings of the same linear data give the same output
+    # Every input in color/ stores the same scene, so each saves as the same reference image. The tolerances, in
+    # 8-bit steps, allow for each encoding's precision; 8-bit linear and YUV encodings are least precise on the
+    # patches with a channel at 0.
+
+    Scenario Outline: Every image encoding of the scene saves as the reference
         Given I am on tab "Load"
-        And I async press "openFile"
-        And I choose input file "color/linear.png" from "openDialog"
-        And I wait until active tab is "Process"
-        And I async press "saveButton"
-        And I choose output file "linear_<name>.png" from "saveDialog"
-        And I am on tab "Load"
         And I async press "openFile"
         And I choose input file "color/<file>" from "openDialog"
         And I wait until active tab is "Process"
         And I async press "saveButton"
-        And I choose output file "<name>.png" from "saveDialog"
-        Then output "<name>.png" and output "linear_<name>.png" should be equal within "1"
+        And I choose output file "<file>.png" from "saveDialog"
+        Then output "<file>.png" and reference "<reference>" should be equal within "<tolerance>" where flat
 
         Examples:
-            | file                      | name       |
-            | srgb_chunk.png            | srgb_chunk |
-            | gama45455.png             | gama45455  |
-            | cicp.png                  | cicp       |
-            | gama100000.png            | gama100000 |
+            | file                       | reference             | tolerance |
+            | tiff32f_rec2020_linear.tif | color_master_sRGB.png | 1         |
+            | png16_srgb_linear.png      | color_master_sRGB.png | 1         |
+            | png16_untagged.png         | color_master_sRGB.png | 1         |
+            | png16_srgb_srgb.png        | color_master_sRGB.png | 1         |
+            | jpg_srgb_srgb.jpg          | color_master_sRGB.png | 2         |
+            | jpg_p3_srgb.jpg            | color_master_sRGB.png | 4         |
+            | jpg_adobergb_gamma22.jpg   | color_master_sRGB.png | 2         |
 
-    Scenario Outline: Tagged videos load and stack
+    Scenario Outline: Every video encoding of the scene stacks to the reference
         Given I am on tab "Load"
         And I async press "openFile"
-        And I choose input file "color/<file>.mp4" from "openDialog"
+        And I choose input file "color/<file>" from "openDialog"
         And I wait until active tab is "Align"
+        And I select "None" from "transformation"
         And I press "alignButton"
         And I wait until active tab is "Stack"
         And I press "stackButton"
         And I wait until active tab is "Process"
         And I async press "saveButton"
         And I choose output file "<file>.png" from "saveDialog"
-        Then output "<file>.png" and reference "<file>.png" should be equal
+        Then output "<file>.png" and reference "<reference>" should be equal within "<tolerance>" where flat
 
         Examples:
-            | file  |
-            | bt709 |
-            | bt601 |
-            | srgb  |
+            | file                         | reference                  | tolerance |
+            | mp4_none_none_full.mp4       | color_master_sRGB.png      | 11        |
+            | mp4_none_none_none.mp4       | color_master_sRGB.png      | 15        |
+            | mp4_bt709_bt709_limited.mp4  | color_master_sRGB.png      | 4         |
+            | mp4_bt709_none_limited.mp4   | color_master_sRGB.png      | 15        |
+            | mp4_bt709_srgb_full.mp4      | color_master_sRGB.png      | 2         |
+            | mp4_10_bt2020_hlg_full.mp4   | color_master_sRGB.png      | 3         |
+            | mp4_10_bt2020_pq_limited.mp4 | color_master_sRGB.png      | 9         |
+            | avi8_rgb.avi                 | color_master_sRGB.png      | 2         |
+            | avi8_gray.avi                | color_master_gray_sRGB.png | 1         |
 
-    Scenario: Untagged YUV video uses the BT.709 matrix and no curve
+    Scenario: The float master's values above white come back at 50% Value
         Given I am on tab "Load"
         And I async press "openFile"
-        And I choose input file "Jupiter.mp4" from "openDialog"
-        And I wait until active tab is "Align"
-        And I set "endFrame" to "5"
-        And I select "None" from "transformation"
-        And I press "alignButton"
-        And I wait until active tab is "Stack"
-        And I press "stackButton"
+        And I choose input file "color/tiff32f_rec2020_linear.tif" from "openDialog"
         And I wait until active tab is "Process"
+        And I set "valueAdjust" to "50"
+        And I wait "1000"
         And I async press "saveButton"
-        And I choose output file "untagged.png" from "saveDialog"
-        And I am on tab "Load"
-        And I async press "openFile"
-        And I choose input file "color/bt709_unspecified_trc.mp4" from "openDialog"
-        And I wait until active tab is "Align"
-        And I select "None" from "transformation"
-        And I press "alignButton"
-        And I wait until active tab is "Stack"
-        And I press "stackButton"
-        And I wait until active tab is "Process"
-        And I async press "saveButton"
-        And I choose output file "unspecified_trc.png" from "saveDialog"
-        Then output "unspecified_trc.png" and output "untagged.png" should be equal within "1"
+        And I choose output file "tiff_value50.png" from "saveDialog"
+        Then output "tiff_value50.png" and reference "color_master_sRGB_value50.png" should be equal within "1" where flat
 
-    Scenario: Limited range video is expanded on load
+    Scenario: The HLG video's values above white come back at 50% Value
         Given I am on tab "Load"
         And I async press "openFile"
-        And I choose input file "color/full_range.mp4" from "openDialog"
+        And I choose input file "color/mp4_10_bt2020_hlg_full.mp4" from "openDialog"
         And I wait until active tab is "Align"
         And I select "None" from "transformation"
         And I press "alignButton"
         And I wait until active tab is "Stack"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I set "valueAdjust" to "50"
+        And I wait "1000"
         And I async press "saveButton"
-        And I choose output file "full_range.png" from "saveDialog"
-        And I am on tab "Load"
-        And I async press "openFile"
-        And I choose input file "color/limited_range.mp4" from "openDialog"
-        And I wait until active tab is "Align"
-        And I select "None" from "transformation"
-        And I press "alignButton"
-        And I wait until active tab is "Stack"
-        And I press "stackButton"
-        And I wait until active tab is "Process"
-        And I async press "saveButton"
-        And I choose output file "limited_range.png" from "saveDialog"
-        Then output "limited_range.png" and output "full_range.png" should be equal within "2" on average
-
-    Scenario Outline: Untagged RGB and gray video match an untagged PNG sequence
-        Given I am on tab "Load"
-        And I async press "openFile"
-        And I choose input file "color/<kind>.avi" from "openDialog"
-        And I wait until active tab is "Align"
-        And I select "None" from "transformation"
-        And I press "alignButton"
-        And I wait until active tab is "Stack"
-        And I press "stackButton"
-        And I wait until active tab is "Process"
-        And I async press "saveButton"
-        And I choose output file "<kind>_video.png" from "saveDialog"
-        And I am on tab "Load"
-        And I async press "openFile"
-        And I choose input file "color/<kind>_sequence/*" from "openDialog"
-        And I wait until active tab is "Align"
-        And I select "None" from "transformation"
-        And I press "alignButton"
-        And I wait until active tab is "Stack"
-        And I press "stackButton"
-        And I wait until active tab is "Process"
-        And I async press "saveButton"
-        And I choose output file "<kind>_sequence.png" from "saveDialog"
-        Then output "<kind>_video.png" and output "<kind>_sequence.png" should be equal within "1"
-        And output "<kind>_video.png" should be tagged as sRGB
-        And output "<kind>_sequence.png" should be tagged as sRGB
-
-        Examples:
-            | kind |
-            | rgb  |
-            | gray |
-
-    Scenario: A saturated Display P3 color clips to sRGB
-        Given I am on tab "Load"
-        And I async press "openFile"
-        And I choose input file "color/p3.jpg" from "openDialog"
-        And I wait until active tab is "Process"
-        And I async press "saveButton"
-        And I choose output file "p3.png" from "saveDialog"
-        And I am on tab "Load"
-        And I async press "openFile"
-        And I choose input file "color/linear.png" from "openDialog"
-        And I wait until active tab is "Process"
-        And I async press "saveButton"
-        And I choose output file "p3_untagged.png" from "saveDialog"
-        Then output "p3.png" at "12,12" should be about "0,207,0" within "12"
-        And output "p3.png" at "32,12" should be about "222,0,0" within "12"
-        And output "p3.png" and output "p3_untagged.png" should differ
+        And I choose output file "hlg_value50.png" from "saveDialog"
+        Then output "hlg_value50.png" and reference "color_master_sRGB_value50.png" should be equal within "6" where flat
 
     Scenario: RAW is decoded without white balance or auto-brightening
         Given I am on tab "Load"
@@ -150,6 +85,7 @@ Feature: Color
         And I wait until active tab is "Stack"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I check "autoBlackLevel"
         And I async press "saveButton"
         And I choose output file "raw.png" from "saveDialog"
         And I set "redAdjust" to "195"
@@ -173,7 +109,7 @@ Feature: Color
     Scenario Outline: Saved files are tagged as sRGB
         Given I am on tab "Load"
         And I async press "openFile"
-        And I choose input file "color/linear.png" from "openDialog"
+        And I choose input file "color/tiff32f_rec2020_linear.tif" from "openDialog"
         And I wait until active tab is "Process"
         And I async press "saveButton"
         And I select "<bits>-bit sRGB" from "bitDepth"
@@ -192,7 +128,7 @@ Feature: Color
     Scenario: Saving with an unsupported extension is refused
         Given I am on tab "Load"
         And I async press "openFile"
-        And I choose input file "color/linear.png" from "openDialog"
+        And I choose input file "color/tiff32f_rec2020_linear.tif" from "openDialog"
         And I wait until active tab is "Process"
         And I async press "saveButton"
         And I choose output file "saved.bmp" from "saveDialog"
@@ -203,7 +139,7 @@ Feature: Color
     Scenario: A saved file reloads as sRGB with the same linear values
         Given I am on tab "Load"
         And I async press "openFile"
-        And I choose input file "color/linear.png" from "openDialog"
+        And I choose input file "color/tiff32f_rec2020_linear.tif" from "openDialog"
         And I wait until active tab is "Process"
         And I async press "saveButton"
         And I select "16-bit sRGB" from "bitDepth"
@@ -213,10 +149,4 @@ Feature: Color
         And I choose saved file "reload.png" from "openDialog"
         And I wait until active tab is "Process"
         Then the loaded file should be tagged as sRGB
-        And output "reload.png" and input "color/linear.png" should decode to the same linear values
-
-    Scenario: An image sequence with mismatched color tags warns
-        Given I am on tab "Load"
-        And I async press "openFile"
-        And I choose input file "color/mismatched_sequence/*" from "openDialog"
-        Then the error dialog should show "Not all images have the same color tags"
+        And output "reload.png" and input "color/tiff32f_rec2020_linear.tif" should decode to the same linear values

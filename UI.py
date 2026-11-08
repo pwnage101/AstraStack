@@ -17,7 +17,7 @@ from Video import Video, loadPsf
 from FrameSource import FrameSource
 from Align import Align, centerOfMass, dilateImg, normalizeImg
 from Stack import Stack, transform
-from Process import Process
+from Process import Process, blackLevelFromPosition, positionFromBlackLevel
 from Globals import *
 from WorkerPools import FRAME_POOL
 import ColorSpace
@@ -47,6 +47,8 @@ class UI:
         self.stack = None
         self.process = None
         self.mousePosition = None
+        # Whether the black level slider is being moved for a new image, which is processed anyway
+        self.settingBlackLevel = False
         self.clickedDriftP1 = False
         self.clickedDriftP2 = False
         self.clickedAreaOfInterest = False
@@ -115,6 +117,10 @@ class UI:
         self.builder.get_object("deringSize").add_mark(0, Gtk.PositionType.TOP, None)
         self.builder.get_object("deringBlend").add_mark(1, Gtk.PositionType.TOP, None)
         self.builder.get_object("blackLevel").add_mark(0, Gtk.PositionType.TOP, None)
+        self.builder.get_object("blackLevel").connect(
+            "format-value",
+            lambda scale, position: f"{100*blackLevelFromPosition(position/100):.1f}",
+        )
         self.builder.get_object("gamma").add_mark(100, Gtk.PositionType.TOP, None)
         self.builder.get_object("value").add_mark(100, Gtk.PositionType.TOP, None)
         self.builder.get_object("red").add_mark(100, Gtk.PositionType.TOP, None)
@@ -476,6 +482,7 @@ class UI:
             self.stack = None
             self.process = Process(self.video.getFrame(index=0,
                                                        colorMode=g.actualColor()))
+            self.applyAutoBlackLevel()
             self.builder.get_object("alignTab").set_sensitive(False)
             self.builder.get_object("stackTab").set_sensitive(False)
             self.builder.get_object("processTab").set_sensitive(True)
@@ -1243,6 +1250,7 @@ class UI:
     def finishedStack(self):
         def update():
             self.process = Process(self.stack.stackedImage)
+            self.applyAutoBlackLevel()
             self.tabs.next_page()
             self.enableUI()
             self.builder.get_object("alignTab").set_sensitive(True)
@@ -1250,9 +1258,29 @@ class UI:
             self.builder.get_object("processTab").set_sensitive(True)
         GLib.idle_add(update)
         
+    def setAutoBlackLevel(self, *args: object) -> None:
+        """Locks the black level slider to the automatic black level while Auto is on, and reprocesses."""
+        auto = self.builder.get_object("autoBlackLevel").get_active()
+        self.builder.get_object("blackLevel").set_sensitive(not auto)
+        if(auto and self.process is not None):
+            self.builder.get_object("blackLevelAdjust").set_value(100*positionFromBlackLevel(self.process.autoBlackLevel))
+
+    def applyAutoBlackLevel(self) -> None:
+        """Moves the black level slider to a new image's automatic black level, if Auto is on, without reprocessing.
+
+        The new image is processed in full when the Process tab is shown, which reads the slider.
+        """
+        if(not self.builder.get_object("autoBlackLevel").get_active()):
+            return
+        self.settingBlackLevel = True
+        try:
+            self.builder.get_object("blackLevelAdjust").set_value(100*positionFromBlackLevel(self.process.autoBlackLevel))
+        finally:
+            self.settingBlackLevel = False
+
     # Processes the final Stacked image
     def processImage(self, *args: object) -> None:
-        if(g.source is None):
+        if(g.source is None or self.settingBlackLevel):
             return
         self.processSpinner.start()
         self.processSpinner.show()
@@ -1288,7 +1316,7 @@ class UI:
         g.deringBlend = int(self.builder.get_object("deringBlendAdjust").get_value())
         
         g.gamma = self.builder.get_object("gammaAdjust").get_value()
-        g.blackLevel = self.builder.get_object("blackLevelAdjust").get_value()
+        g.blackLevel = blackLevelFromPosition(self.builder.get_object("blackLevelAdjust").get_value()/100)
         g.value = self.builder.get_object("valueAdjust").get_value()
         
         g.redAdjust = self.builder.get_object("redAdjust").get_value()

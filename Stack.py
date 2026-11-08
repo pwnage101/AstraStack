@@ -77,8 +77,7 @@ class Stack:
 
         self.stackedImage /= g.limit
         
-        # Make sure there wasn't any overshoot from the transformations
-        self.stackedImage[self.stackedImage>1] = 1
+        # Make sure there wasn't any undershoot from the transformations. Values above white are kept for Process.
         self.stackedImage[self.stackedImage<0] = 0
         self.stackedImage = self.stackedImage.astype(np.float32)
         

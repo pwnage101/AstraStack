@@ -253,7 +253,7 @@ class Video:
         """Applies the color mode to stored values, and adjusts their description to match.
 
         Demosaiced data is sensor data: it has no curve and no primaries, and unless the file states its levels,
-        black is 0 and white is the type's maximum. Other color modes keep the description.
+        it has no black level and white is the type's maximum. Other color modes keep the description.
 
         Args:
             image: The stored image (BGR, or gray).
@@ -268,13 +268,13 @@ class Video:
             return (Video._applyColorMode(img=image, colorMode=colorMode), params, workingSpace)
         if(params.whiteLevel is None):
             white = float(np.iinfo(image.dtype).max) if np.issubdtype(image.dtype, np.integer) else 1.0
-            params = ColorSpace.DecodeParams(blackLevel=(0.0, 0.0, 0.0), whiteLevel=white)
+            params = ColorSpace.DecodeParams(whiteLevel=white)
         if(image.dtype not in (np.uint8, np.uint16)):
             # OpenCV only demosaics integers
             scale = 65535/params.whiteLevel
             image = np.around(np.clip(image*scale, 0, 65535)).astype(np.uint16)
-            params = ColorSpace.DecodeParams(blackLevel=tuple(float(v)*scale for v in params.blackLevel),
-                                             whiteLevel=65535.0)
+            blackLevel = None if params.blackLevel is None else tuple(float(v)*scale for v in params.blackLevel)
+            params = ColorSpace.DecodeParams(blackLevel=blackLevel, whiteLevel=65535.0)
         else:
             params = ColorSpace.DecodeParams(blackLevel=params.blackLevel, whiteLevel=params.whiteLevel)
         return (Video._applyColorMode(img=image, colorMode=colorMode), params, ColorSpace.UNTAGGED)
@@ -345,6 +345,9 @@ class Video:
         Returns:
             The guessed color mode.
         """
+        if(image.dtype not in (np.uint8, np.uint16)):
+            # Float frames are guessed from a 16-bit copy, since demosaicing needs integers
+            image = np.around(np.clip(image/max(float(image.max()), 1e-12), 0, 1)*65535).astype(np.uint16)
         # Assume its color to start with
         colorMode = Video.COLOR_RGB
         rgb = Video._bgrFromSourceFrame(image, Video.COLOR_RGB)

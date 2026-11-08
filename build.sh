@@ -26,6 +26,7 @@ if [[ "$OSTYPE" == "linux-gnu" ]]; then
                            --hidden-import "av" \
                            --hidden-import "png" \
                            --hidden-import "tifffile" \
+                           --hidden-import "imagecodecs._cms" \
                            --collect-data "colour" \
                            --exclude-module "gi.repository.Gst" \
                            --exclude-module "$EXCLUDE_SSL" \
@@ -80,6 +81,7 @@ elif [[ "$OSTYPE" == "msys" ]]; then
                 --hidden-import "av" \
                 --hidden-import "png" \
                 --hidden-import "tifffile" \
+                --hidden-import "imagecodecs._cms" \
                 --collect-data "colour" \
                 --exclude-module "FixTk" \
                 --exclude-module "tcl" \

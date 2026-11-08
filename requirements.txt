@@ -16,3 +16,4 @@ Pillow==13.0.0
 av==19.0.2
 pypng==0.20220715.0
 tifffile==2026.3.3
+imagecodecs==2026.1.14

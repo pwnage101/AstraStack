@@ -156,8 +156,10 @@ Feature: Video
         And I select "Bayer RGGB" from "colorMode"
         And I press "alignButton"
         And I wait until active tab is "Stack"
+        And I uncheck "autoCrop"
         And I press "stackButton"
         And I wait until active tab is "Process"
+        And I check "autoBlackLevel"
         And I async press "saveButton"
         And I choose output file "avi8_rggb.png" from "saveDialog"
         Then output "avi8_rggb.png" and reference "avi8_rggb.png" should be equal

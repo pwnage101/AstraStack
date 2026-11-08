@@ -275,9 +275,28 @@ class VideoSource(FrameSource):
                                                                   colorRange=codec.color_range,
                                                                   isYUV=isYUV,
                                                                   fullRangeFormat=formatName.startswith("yuvj"))
+        self.palette = VideoSource.readPalette(self.path) if formatName == "pal8" else None
         self.decoder = None
         self.lastTimestamp = None
         self.lastFrame = None
+
+    @staticmethod
+    def readPalette(path: str) -> np.ndarray:
+        """Returns the palette of a pal8 video.
+
+        Demuxers like AVI's attach the palette only to the first packet read, which opening the
+        video already reads and a seek discards, so frames decoded after a seek have an empty
+        palette. The first frame is decoded without seeking, in a container of its own.
+
+        Args:
+            path: The video file.
+
+        Returns:
+            The 256 entries as uint8 RGB.
+        """
+        with av.open(path) as container:
+            videoFrame = next(container.decode(video=0))
+        return np.frombuffer(videoFrame.planes[1], np.uint8).reshape(256, 4)[:, [2, 1, 0]]
 
     @staticmethod
     def formatBits(videoFormat: av.VideoFormat) -> int:
@@ -343,7 +362,11 @@ class VideoSource(FrameSource):
         else:
             # Converted at the source's bit depth and widened exactly, so untagged RGB/gray loads unchanged
             sourceBits = 8 if VideoSource.formatBits(videoFrame.format) <= 8 else 16
-            image = videoFrame.reformat(format="rgb24" if sourceBits == 8 else "rgb48le").to_ndarray()
+            if(self.palette is not None):
+                indices = np.frombuffer(videoFrame.planes[0], np.uint8).reshape(videoFrame.height, -1)
+                image = self.palette[indices[:, :videoFrame.width]]
+            else:
+                image = videoFrame.reformat(format="rgb24" if sourceBits == 8 else "rgb48le").to_ndarray()
             if(sourceBits == 8):
                 image = image.astype(np.uint16)*257
             if(self.params.range == "limited"):
@@ -353,6 +376,14 @@ class VideoSource(FrameSource):
 
     def readFrame(self, index: int) -> Frame | None:
         """Frames are converted to 16-bit BGR, whatever the stream's depth."""
+        if(index == 0 and self.timestamps is None):
+            # Decoded in a container of its own, without reading every packet's timestamp, so thumbnails are quick
+            self.openContainer()
+            with av.open(self.path) as container:
+                videoFrame = next(container.decode(video=0), None)
+            if(videoFrame is None):
+                return None
+            return Frame(image=self.frameToImage(videoFrame), params=self.params, workingSpace=self.workingSpace)
         timestamps = self.frameTimestamps()
         if(index >= len(timestamps)):
             return None

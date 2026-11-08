@@ -201,6 +201,26 @@ def test_loadFrames_measures_sharpness_after_color_mode(colorMode: int) -> None:
 
 
 COLOR = INPUTS_DIR/"color"
+REFERENCES = INPUTS_DIR.parent/"reference"
+
+# Each color input, with how far it may decode from its reference, in 8-bit sRGB steps. 8-bit linear and YUV
+# encodings are least precise on the patches with a channel at 0, where the sRGB curve is steepest.
+COLOR_INPUTS = {"tiff32f_rec2020_linear.tif": 1,
+                "png16_srgb_linear.png": 1,
+                "png16_untagged.png": 1,
+                "png16_srgb_srgb.png": 1,
+                "jpg_srgb_srgb.jpg": 2,
+                "jpg_p3_srgb.jpg": 4,
+                "jpg_adobergb_gamma22.jpg": 2,
+                "mp4_none_none_full.mp4": 11,
+                "mp4_none_none_none.mp4": 15,
+                "mp4_bt709_bt709_limited.mp4": 4,
+                "mp4_bt709_none_limited.mp4": 15,
+                "mp4_bt709_srgb_full.mp4": 2,
+                "mp4_10_bt2020_hlg_full.mp4": 3,
+                "mp4_10_bt2020_pq_limited.mp4": 9,
+                "avi8_rgb.avi": 2,
+                "avi8_gray.avi": 1}
 
 # The user's real camera files, used when present
 LOCAL_RAWS = {"ARW": "/home/sankey/photos/2022-09-21_pq_canyon/raw/DSC02636.ARW",
@@ -208,53 +228,42 @@ LOCAL_RAWS = {"ARW": "/home/sankey/photos/2022-09-21_pq_canyon/raw/DSC02636.ARW"
               "DNG": "/home/sankey/photos/2026-07-10_san_diego_pq_canyon/raw/IMG_20260710_182014_0.dng"}
 
 
-@pytest.mark.parametrize("file, transfer, workingSpace",
-                         [("linear.png", None, ColorSpace.UNTAGGED),
-                          ("gama100000.png", None, ColorSpace.UNTAGGED),
-                          ("gama100000_chrm_srgb.png", None, ColorSpace.SRGB),
-                          ("srgb_chunk.png", ("sRGB", None), ColorSpace.SRGB),
-                          ("gama45455.png", ("sRGB", None), ColorSpace.SRGB),
-                          ("cicp.png", ("sRGB", None), ColorSpace.SRGB),
-                          ("exif_srgb.jpg", ("sRGB", None), ColorSpace.SRGB),
-                          ("p3.png", "ICC", ColorSpace.named("Display P3")),
-                          ("p3.jpg", "ICC", ColorSpace.named("Display P3")),
-                          ("gray_icc.png", "ICC", ColorSpace.UNTAGGED),
-                          ("lut_srgb.png", ("Gamma", ColorSpace.LUT_GAMMA), ColorSpace.named("ITU-R BT.2020"))])
-def test_describe_fixtures(file: str, transfer: object, workingSpace: ColorSpace.WorkingSpace) -> None:
-    """Each image fixture is described by its tags; untagged ones have no transfer and no primaries."""
-    image, params, space = Video.decodeImage(str(COLOR/file))
-    if(transfer == "ICC"):
-        assert params.transfer[0] == "ICC"
-    else:
-        assert params.transfer == transfer
-    assert space == workingSpace
-    if(file == "lut_srgb.png"):
-        assert params.icc is not None and params.lut is not None
+@pytest.mark.parametrize("file, tolerance", COLOR_INPUTS.items())
+def test_color_inputs_decode_to_the_reference(file: str, tolerance: float) -> None:
+    """Every color input decodes to the same scene as its reference, inside the flat patches.
+
+    4:2:0 chroma is shared by neighboring pixels, so the edges between patches are left out.
+    """
+    video = Video(FrameSource.open(str(COLOR/file)))
+    linear = cv2.cvtColor(video.getFrame(index=0, colorMode=Video.COLOR_RGB), cv2.COLOR_BGR2RGB)
+    encoded = ColorSpace.displayEncode(img=linear, workingSpace=video.workingSpace)
+    reference = cv2.imread(str(REFERENCES/("color_master_gray_sRGB.png" if "gray" in file else "color_master_sRGB.png")))
+    kernel = np.ones((5, 5), dtype=np.uint8)
+    flat = np.all(cv2.dilate(reference, kernel) == cv2.erode(reference, kernel), axis=2)
+    diff = np.abs(encoded*255 - reference[..., ::-1])[flat]
+    assert diff.max() <= tolerance
 
 
-@pytest.mark.parametrize("file", ["srgb_chunk.png", "gama45455.png", "cicp.png", "gama100000.png"])
-def test_tagged_encodings_linearize_alike(file: str) -> None:
-    """Every encoding of the linear source decodes to the same linear values."""
-    reference = Video(ImageSequenceSource(str(COLOR/"linear.png"))).getFrame(index=0,
-                                                                             colorMode=Video.COLOR_RGB)
-    frame = Video(ImageSequenceSource(str(COLOR/file))).getFrame(index=0,
-                                                                 colorMode=Video.COLOR_RGB)
-    assert np.abs(frame - reference).max() < 2e-5
+@pytest.mark.parametrize("file", ["tiff32f_rec2020_linear.tif", "mp4_10_bt2020_hlg_full.mp4", "mp4_10_bt2020_pq_limited.mp4"])
+def test_values_above_white_are_kept(file: str) -> None:
+    """The float master and HDR videos keep the scene's brightest patch, a gray 3.5 times white, at the bottom right.
+
+    FFmpeg encoded the HDR videos with luma about 0.4% high, which their curves raise to about 2% at this patch.
+    """
+    linear = Video(FrameSource.open(str(COLOR/file))).getFrame(index=0, colorMode=Video.COLOR_RGB)
+    assert linear[112, 240] == pytest.approx([3.5]*3, rel=0.03)
 
 
-@pytest.mark.parametrize("file, transfer, matrix, colorRange, primaries",
-                         [("bt709.mp4", ("BT.709", None), "BT.709", "full", ColorSpace.SRGB),
-                          ("bt601.mp4", ("BT.601", None), "BT.601", "full", ColorSpace.named("SMPTE C")),
-                          ("srgb.mp4", ("sRGB", None), "BT.709", "full", ColorSpace.SRGB),
-                          ("bt709_unspecified_trc.mp4", None, "BT.709", "full", ColorSpace.SRGB),
-                          ("limited_range.mp4", None, "BT.709", "limited", ColorSpace.UNTAGGED),
-                          ("rgb.avi", None, None, "full", ColorSpace.UNTAGGED),
-                          ("gray.avi", None, None, "full", ColorSpace.UNTAGGED)])
-def test_video_tags(file: str, transfer: object, matrix: str | None, colorRange: str, primaries: object) -> None:
-    """Video streams are described from their color tags."""
-    params, workingSpace = VideoSource(str(COLOR/file)).description()
-    assert params == ColorSpace.DecodeParams(transfer=transfer, yuvMatrix=matrix, range=colorRange)
-    assert workingSpace == primaries
+def test_loadFrames_flags_mismatched_color_tags() -> None:
+    """Images tagged differently from the first are flagged, since every image is decoded like the first."""
+    source = ImageSequenceSource([str(COLOR/"png16_untagged.png"), str(COLOR/"png16_srgb_srgb.png")])
+    mismatch = loadFrames(source=source,
+                          indices=range(0, 2),
+                          frameSize=(256, 128),
+                          colorMode=Video.COLOR_RGB,
+                          description=source.description(),
+                          progress=FakeProgress())[3]
+    assert mismatch
 
 
 def test_jupiter_is_untagged_full_range_bt709() -> None:
@@ -274,26 +283,6 @@ def test_video_frame_times_match_opencv() -> None:
         cvTimes.append(vidcap.get(cv2.CAP_PROP_POS_MSEC))
     assert len(times) == len(cvTimes) == 60
     assert np.allclose(times, cvTimes, atol=1e-6)
-
-
-def test_limited_range_is_expanded_on_load() -> None:
-    """The limited range re-encode decodes like the full range original (within 8-bit limited quantization)."""
-    limited = Video(VideoSource(str(COLOR/"limited_range.mp4"))).getFrame(index=0,
-                                                                          colorMode=Video.COLOR_RGB)
-    full = Video(VideoSource(str(COLOR/"full_range.mp4"))).getFrame(index=0,
-                                                                    colorMode=Video.COLOR_RGB)
-    assert abs(float((limited - full).mean())) < 0.002
-    assert np.abs(limited - full).max() < 0.02
-
-
-@pytest.mark.parametrize("kind", ["rgb", "gray"])
-def test_untagged_rgb_and_gray_video_load_unchanged(kind: str) -> None:
-    """Untagged RGB/gray video frames decode to exactly the values of the matching untagged PNGs."""
-    frame = Video(VideoSource(str(COLOR/(kind + ".avi")))).getFrame(index=2,
-                                                                    colorMode=Video.COLOR_RGB)
-    png = Video(ImageSequenceSource(str(COLOR/(kind + "_sequence")/"frame_002.png"))).getFrame(index=0,
-                                                                                               colorMode=Video.COLOR_RGB)
-    assert np.abs(frame - png).max() < 1e-4
 
 
 def test_raw_postprocess_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -333,7 +322,7 @@ def test_raw_postprocess_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_raw_dng_has_no_white_balance() -> None:
-    """The Pixel 8a crop decodes with its levels and matrix, and its neutral gravel keeps the raw ratios."""
+    """The Pixel 8a crop decodes with its stated black kept, and its neutral gravel keeps the raw ratios."""
     import rawpy
     file = str(INPUTS_DIR/"raw"/"pixel_crop_1.dng")
     image, params, workingSpace = Video.decodeImage(file)
@@ -341,12 +330,13 @@ def test_raw_dng_has_no_white_balance() -> None:
     assert np.allclose(workingSpace.toXYZ @ np.ones(3), ColorSpace.D65_XYZ, atol=1e-6)
     linear = Video(ImageSequenceSource(file)).getFrame(index=0,
                                                        colorMode=Video.COLOR_RGB)
-    region = linear[256:336, 224:320].reshape(-1, 3).mean(axis=0)[::-1]
+    black = 64/1023
+    assert np.percentile(linear, 0.1) == pytest.approx(black, abs=0.005)
+    region = linear[256:336, 224:320].reshape(-1, 3).mean(axis=0)[::-1] - black
     with rawpy.imread(file) as raw:
         gains = np.array(raw.camera_whitebalance[:3])/raw.camera_whitebalance[1]
     ratios = region/region[1]
     assert np.allclose(ratios, 1/gains, rtol=0.1)
-    assert linear.min() < 0
 
 
 @pytest.mark.parametrize("kind", sorted(LOCAL_RAWS))
@@ -359,7 +349,7 @@ def test_local_camera_raws(kind: str) -> None:
     assert workingSpace.toXYZ is not None
     assert np.allclose(workingSpace.toXYZ @ np.ones(3), ColorSpace.D65_XYZ, atol=1e-6)
     linear = ColorSpace.linearize(img=image, params=params)
-    assert np.percentile(linear, 1) < 0.02
+    assert np.percentile(linear, 1) - min(params.blackLevel)/params.whiteLevel < 0.02
     assert linear.max() <= 1.01
 
 
@@ -367,9 +357,7 @@ def test_fits_bayer_pattern_and_levels() -> None:
     """The Bayer FITS states GBRG (RGGB shifted one row) and keeps one scale for both frames."""
     first, params1, space = Video.decodeImage(str(INPUTS_DIR/"fits"/"bayer_1.fits"))
     second, params2, space = Video.decodeImage(str(INPUTS_DIR/"fits"/"bayer_2.fits"))
-    assert params1 == params2 == ColorSpace.DecodeParams(bayerPattern="GBRG",
-                                                         blackLevel=(0.0, 0.0, 0.0),
-                                                         whiteLevel=60000.0)
+    assert params1 == params2 == ColorSpace.DecodeParams(bayerPattern="GBRG", whiteLevel=60000.0)
     video = Video(ImageSequenceSource([str(INPUTS_DIR/"fits"/"bayer_1.fits"), str(INPUTS_DIR/"fits"/"bayer_2.fits")]))
     assert video.guessColorMode(image=first, params=params1) == Video.COLOR_GBRG
     frames = [video.getFrame(index=index, colorMode=Video.COLOR_GBRG) for index in range(2)]

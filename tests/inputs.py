@@ -37,5 +37,7 @@ DNG16_RGGB_SEQUENCE = [str(path) for path in sorted((INPUTS_DIR / "dng16_rggb_se
 DNG16_RGGB_SEQUENCE_DIMENSIONS = (800, 600)
 # An 8-bit video of an RGGB Bayer mosaic.
 AVI8_RGGB = str(INPUTS_DIR / "avi8_rggb.avi")
+# An 8-bit palette video (pal8), like capture programs' raw AVIs: ffmpeg's testsrc, 3 frames.
+AVI8_PAL8 = str(INPUTS_DIR / "avi8_pal8.avi")
 # A text file, which is neither an image nor a video.
 NOT_MEDIA = str(INPUTS_DIR / "not_an_image.txt")

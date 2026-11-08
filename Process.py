@@ -3,15 +3,65 @@ cv2 = lazy("cv2")
 np = lazy("numpy")
 pywt = lazy("pywt")
 import copy
+import math
 from concurrent.futures import wait
 from time import sleep
 from deconvolution import *
 from Globals import *
 from WorkerPools import CHANNEL_POOL, PROCESS_CONTEXT
+import ColorSpace
 
 def colorAdjust(C, adjust):
     C *= (adjust/100)*(g.value/100)
     return C
+
+# Steepness of the black level slider's curve, which sets 15% at its middle so the low levels sensors use get most of
+# its travel
+BLACK_LEVEL_CURVE = 5
+# The highest black level estimated from an image; sensors rarely have higher ones
+MAX_AUTO_BLACK_LEVEL = 0.15
+
+def blackLevelFromPosition(position: float) -> float:
+    """Returns the black level set by a position of the logarithmic black level slider.
+
+    Args:
+        position: The slider's position, 0-1.
+
+    Returns:
+        The black level, 0-1: 0 at the start, 0.15 in the middle and 1 at the end.
+    """
+    floor = 2**-BLACK_LEVEL_CURVE
+    return (2**(BLACK_LEVEL_CURVE*(position - 1)) - floor)/(1 - floor)
+
+def positionFromBlackLevel(level: float) -> float:
+    """Returns the position of the logarithmic black level slider that sets a black level.
+
+    Args:
+        level: The black level, 0-1.
+
+    Returns:
+        The slider's position, 0-1.
+    """
+    floor = 2**-BLACK_LEVEL_CURVE
+    return 1 + math.log2(level*(1 - floor) + floor)/BLACK_LEVEL_CURVE
+
+def autoBlackLevel(img: np.ndarray, params: ColorSpace.DecodeParams | None) -> float:
+    """Returns the black level of linear working data: the one its file states, else an estimate.
+
+    Each channel's black is estimated as the darkest value of a blurred, downsampled copy. One level is applied to
+    every channel, so the lowest channel's is used, which clips none of them.
+
+    Args:
+        img: Linear working data.
+        params: How the input was decoded, with the levels its file states.
+
+    Returns:
+        The black level, 0-1; an estimate is at most MAX_AUTO_BLACK_LEVEL.
+    """
+    if(params is not None and params.blackLevel is not None and params.whiteLevel):
+        return min(params.blackLevel)/params.whiteLevel
+    small = cv2.GaussianBlur(cv2.resize(img, (100, 100), interpolation=cv2.INTER_LINEAR), (0, 0), 2)
+    return float(np.clip(small.min(), 0, MAX_AUTO_BLACK_LEVEL))
 
 class Process:
 
@@ -34,6 +84,7 @@ class Process:
 
     def __init__(self, stackedImage: np.ndarray) -> None:
         self.stackedImage = cv2.cvtColor(stackedImage, cv2.COLOR_BGR2RGB)
+        self.autoBlackLevel = autoBlackLevel(img=self.stackedImage, params=g.decodeParams)
         self.h, self.w = stackedImage.shape[:2]
         self.mask = None
         self.thresh = None
@@ -91,8 +142,8 @@ class Process:
         
     # Calculates the wavelet coefficents for each channel
     def calculateCoefficients(self):
-        # Stretch Function
-        self.stackedImage = np.clip(self.stackedImage, 0, 1)
+        # Stretch Function. Values above white are kept for the Value slider to bring back.
+        self.stackedImage = np.maximum(self.stackedImage, 0)
         if(g.stretchFunction is not Process.STRETCH_NONE):
             gauss = cv2.resize(self.stackedImage, (100, 100), interpolation=cv2.INTER_LINEAR)
             gauss = cv2.cvtColor(gauss, cv2.COLOR_RGB2HLS)
@@ -100,7 +151,7 @@ class Process:
             V = cv2.GaussianBlur(V, (0,0), 2)
             low = V.min()
             self.stackedImage -= low
-            self.stackedImage = np.clip(self.stackedImage, 0, 1)
+            self.stackedImage = np.maximum(self.stackedImage, 0)
         if(g.stretchFunction == Process.STRETCH_SQRT):
             self.stackedImage = np.ma.sqrt(self.stackedImage)
         elif(g.stretchFunction == Process.STRETCH_CBRT):
@@ -239,7 +290,7 @@ class Process:
         img = self.deringedImage
         
         # Black Level
-        img = (img - (g.blackLevel/255))*(255/max(1, (255-g.blackLevel)))
+        img = (img - g.blackLevel)/max(1 - g.blackLevel, 1/255)
 
         # Decompose
         (R, G, B) = cv2.split(img)
