@@ -7,7 +7,7 @@ Feature: Single Image
         And I wait until active tab is "Process"
         And I async press "saveButton"
         And I choose output file "test_unchanged.png" from "saveDialog"
-        Then output "test_unchanged.png" and input "test.jpg" should be equal
+        Then output "test_unchanged.png" and input "test.jpg" should decode to the same linear values
   
     Scenario: Test processing single image
         Given I am on tab "Load"
@@ -55,9 +55,9 @@ Feature: Single Image
         And I choose input file "16bit.png" from "openDialog"
         And I wait until active tab is "Process"
         And I async press "saveButton"
-        And I select "16-bit" from "bitDepth"
+        And I select "16-bit sRGB" from "bitDepth"
         And I choose output file "16bit_unchanged.png" from "saveDialog"
-        Then output "16bit_unchanged.png" and input "16bit.png" should be equal
+        Then output "16bit_unchanged.png" and input "16bit.png" should decode to the same linear values
         
     Scenario: Test masking stretched image
         Given I am on tab "Load"
@@ -70,3 +70,14 @@ Feature: Single Image
         And I async press "saveButton"
         And I choose output file "mask.png" from "saveDialog"
         Then output "mask.png" and reference "mask.png" should be equal
+
+    Scenario: Saving with an unsupported extension is refused
+        Given I am on tab "Load"
+        And I async press "openFile"
+        And I choose input file "test.jpg" from "openDialog"
+        And I wait until active tab is "Process"
+        And I async press "saveButton"
+        And I choose output file "saved.bmp" from "saveDialog"
+        Then the error dialog should show "Only .png, .jpg/.jpeg and .tif/.tiff files are supported"
+        And I cancel "saveDialog"
+        And output "saved.bmp" should not exist

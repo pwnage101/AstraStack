@@ -15,6 +15,9 @@ sys.path.insert(0, os.getcwd())
 
 from UI import UI
 from Globals import g
+from Video import Video
+from FrameSource import ImageSequenceSource
+import ColorSpace
 
 tabMap = {"Load": UI.LOAD_TAB,
           "Align": UI.ALIGN_TAB,
@@ -208,8 +211,19 @@ def setUncheck(context, checkbox):
         g.ui.builder.get_object(checkbox).set_active(False)
     idle_add_delay(update)
     
+@given(u'I set "{checkbox}" checkbox to "{state}"')
+def setCheckState(context: Context, checkbox: str, state: str) -> None:
+    """Checks or unchecks a checkbox, where ``state`` is "on" or "off"."""
+    widgetValidation(checkbox)
+    def update():
+        g.ui.builder.get_object(checkbox).set_active(state == "on")
+    idle_add_delay(update)
+
 @given(u'I select "{value}" from "{combo}"')
 def setCombo(context, value, combo):
+    if(value == "Auto" and not g.ui.builder.get_object(combo).is_sensitive()):
+        # An inactive drop-down (e.g. Pattern unless Demosaic is On) is already Auto
+        return
     widgetValidation(combo)
     model = g.ui.builder.get_object(combo).get_model()
     iter = model.get_iter_first()
@@ -217,7 +231,7 @@ def setCombo(context, value, combo):
     i = 0
     while True:
         val = model.get_value(iter, 0)
-        if(val == value):
+        if(val == value or (value == "Auto" and val.startswith("Auto"))):
             id = i
         iter = model.iter_next(iter)
         i += 1
@@ -335,3 +349,88 @@ def compareOutputToReference(context: Context, outputFile: str, referenceFile: s
         os.path.join(context.testOutputs, outputFile),
         os.path.join(TEST_REFERENCES_PATH, referenceFile),
     )
+
+@then(u'output "{outputFile}" and reference "{referenceFile}" should be equal within "{maxDiff}" in mask "{maskFile}"')
+def compareOutputToReferenceInMask(
+    context: Context,
+    outputFile: str,
+    referenceFile: str,
+    maxDiff: str,
+    maskFile: str,
+) -> None:
+    """Asserts that an output file matches a reference within a tolerance, where a reference mask is 255."""
+    output = cv2.imread(os.path.join(context.testOutputs, outputFile), cv2.IMREAD_UNCHANGED)
+    reference = cv2.imread(os.path.join(TEST_REFERENCES_PATH, referenceFile), cv2.IMREAD_UNCHANGED)
+    mask = cv2.imread(os.path.join(TEST_REFERENCES_PATH, maskFile), cv2.IMREAD_GRAYSCALE) == 255
+    assert output.shape == reference.shape, f"'{outputFile}' {output.shape} and '{referenceFile}' {reference.shape} differ in shape"
+    diff = cv2.absdiff(output, reference)[mask].max()
+    assert diff <= float(maxDiff), f"'{outputFile}' and '{referenceFile}' differ by up to {diff}"
+
+@then(u'output "{outputFile}" and reference "{referenceFile}" should be equal within "{maxDiff}"')
+def compareOutputToReferenceWithin(context: Context, outputFile: str, referenceFile: str, maxDiff: str) -> None:
+    """Asserts that an output file matches a reference within a tolerance."""
+    output = cv2.imread(os.path.join(context.testOutputs, outputFile), cv2.IMREAD_UNCHANGED)
+    reference = cv2.imread(os.path.join(TEST_REFERENCES_PATH, referenceFile), cv2.IMREAD_UNCHANGED)
+    assert output.shape == reference.shape, f"'{outputFile}' {output.shape} and '{referenceFile}' {reference.shape} differ in shape"
+    diff = cv2.absdiff(output, reference).max()
+    assert diff <= float(maxDiff), f"'{outputFile}' and '{referenceFile}' differ by up to {diff}"
+
+def assertLinearEqual(file1: str, file2: str, maxDiff: float) -> None:
+    """Asserts that two image files decode to the same linear values, compared as display-encoded sRGB.
+
+    Each file is read through its own color tags, so an untagged input and its tagged output can match.
+
+    Args:
+        file1: Path of the first image.
+        file2: Path of the second image.
+        maxDiff: Largest allowed difference of the sRGB-encoded values, in 8-bit steps.
+    """
+    encoded = []
+    for file in (file1, file2):
+        video = Video(ImageSequenceSource(file))
+        linear = cv2.cvtColor(video.getFrame(index=0), cv2.COLOR_BGR2RGB)
+        encoded.append(ColorSpace.displayEncode(img=linear, workingSpace=video.workingSpace))
+    assert encoded[0].shape == encoded[1].shape, f"'{file1}' and '{file2}' differ in shape"
+    diff = np.abs(encoded[0] - encoded[1]).max()*255
+    assert diff <= maxDiff, f"'{file1}' and '{file2}' differ by up to {diff:.3f} 8-bit steps"
+
+@then(u'output "{outputFile}" and input "{inputFile}" should decode to the same linear values')
+def compareLinearOutputToInput(context: Context, outputFile: str, inputFile: str) -> None:
+    """Asserts that an output file decodes to the same linear values as a file in ``TEST_INPUTS_PATH``."""
+    assertLinearEqual(
+        file1=os.path.join(context.testOutputs, outputFile),
+        file2=os.path.join(TEST_INPUTS_PATH, inputFile),
+        maxDiff=1,
+    )
+
+@step(u'I cancel "{dialog}"')
+def cancelDialog(context: Context, dialog: str) -> None:
+    window = g.ui.builder.get_object(dialog)
+    while(not window.is_visible()):
+        delay(0.01)
+    delay()
+    def update():
+        window.response(Gtk.ResponseType.CANCEL)
+    idle_add_delay(update)
+    while(window.is_visible()):
+        delay(0.01)
+
+@then(u'the error dialog should show "{text}"')
+def errorDialogShows(context: Context, text: str) -> None:
+    """Asserts that the error dialog is shown with a message containing the text, then closes it."""
+    dialog = g.ui.builder.get_object("errorDialog")
+    deadline = time.monotonic() + WIDGET_TIMEOUT
+    while(not dialog.is_visible() and time.monotonic() < deadline):
+        delay(0.05)
+    assert dialog.is_visible(), "The error dialog is not shown"
+    delay()
+    message = []
+    def update():
+        message.append(dialog.get_property("secondary-text"))
+        dialog.response(Gtk.ResponseType.OK)
+    idle_add_delay(update)
+    assert text in message[0], f"The error dialog shows '{message[0]}'"
+
+@then(u'output "{file}" should not exist')
+def outputMissing(context: Context, file: str) -> None:
+    assert not os.path.exists(os.path.join(context.testOutputs, file)), f"'{file}' was written"

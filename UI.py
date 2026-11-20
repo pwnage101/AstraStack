@@ -14,10 +14,10 @@ from threading import Thread
 
 from Preferences import Preferences
 from Video import Video, loadPsf
-from FrameSource import FrameSource
+from Constants import DemosaicAlgorithm, DemosaicMode, MosaicPattern
 from Align import Align, centerOfMass, dilateImg, normalizeImg
 from Stack import Stack, transform
-from Process import Process
+from Process import Process, blackLevelFromPosition, positionFromBlackLevel
 from Globals import *
 from WorkerPools import FRAME_POOL
 from deconvolution import *
@@ -42,10 +42,13 @@ class UI:
         self.preferences = Preferences()
         self.newVersionUrl = ""
         self.video = None
+        self.updatingDemosaic = False
         self.align = None
         self.stack = None
         self.process = None
         self.mousePosition = None
+        # Whether the black level slider is being moved for a new image, which is processed anyway
+        self.settingBlackLevel = False
         self.clickedDriftP1 = False
         self.clickedDriftP2 = False
         self.clickedAreaOfInterest = False
@@ -63,7 +66,12 @@ class UI:
         self.preferencesDialog = self.builder.get_object("preferencesDialog")
         self.tabs = self.builder.get_object("tabs")
         self.cpus = self.builder.get_object("cpus")
-        self.colorMode = self.builder.get_object("colorMode")
+        self.demosaicMode = self.builder.get_object("demosaicMode")
+        self.mosaicPattern = self.builder.get_object("mosaicPattern")
+        self.demosaicAlgorithm = self.builder.get_object("demosaicAlgorithm")
+        self.supportedDemosaicRows = {}
+        for combo in (self.demosaicMode, self.mosaicPattern, self.demosaicAlgorithm):
+            combo.set_cell_data_func(combo.get_cells()[0], self.greyUnsupportedDemosaic)
         self.progressBox = self.builder.get_object("progressBox")
         self.progress = self.builder.get_object("progress")
         self.processSpinner = self.builder.get_object("processSpinner")
@@ -114,6 +122,10 @@ class UI:
         self.builder.get_object("deringSize").add_mark(0, Gtk.PositionType.TOP, None)
         self.builder.get_object("deringBlend").add_mark(1, Gtk.PositionType.TOP, None)
         self.builder.get_object("blackLevel").add_mark(0, Gtk.PositionType.TOP, None)
+        self.builder.get_object("blackLevel").connect(
+            "format-value",
+            lambda scale, position: f"{100*blackLevelFromPosition(position/100):.1f}",
+        )
         self.builder.get_object("gamma").add_mark(100, Gtk.PositionType.TOP, None)
         self.builder.get_object("value").add_mark(100, Gtk.PositionType.TOP, None)
         self.builder.get_object("red").add_mark(100, Gtk.PositionType.TOP, None)
@@ -145,7 +157,11 @@ class UI:
         g.areaOfInterestP1 = (0, 0)
         g.areaOfInterestP2 = (0, 0)
         
-        g.guessedColorMode = Video.COLOR_RGB
+        g.demosaicMode = DemosaicMode.AUTO
+        g.mosaicPattern = None
+        g.demosaicAlgorithm = None
+        # The resolved demosaic choice, which the workers read
+        g.demosaicIntent = None
         
         g.limit = 0
         
@@ -161,7 +177,7 @@ class UI:
         self.setThreads()
         self.checkNewVersion()
         self.setProgress()
-        self.setColorMode()
+        self.updateDemosaicChoices()
         self.setNormalize()
         self.setDilate()
         self.setAlignChannels()
@@ -287,7 +303,7 @@ class UI:
         thread.start()
         
     # Sets the number of threads to use
-    def setThreads(self, *args):
+    def setThreads(self, *args: object) -> None:
         g.nThreads = int(self.cpus.get_value())
         self.preferences.set("cpus", g.nThreads)
         # The next job creates a pool of the new size
@@ -346,6 +362,29 @@ class UI:
         Z = GLib.Bytes.new(z)
         height, width = img.shape[:2]
         return GdkPixbuf.Pixbuf.new_from_bytes(Z, GdkPixbuf.Colorspace.RGB, False, 8, width, height, width*3)
+
+    def createDisplayPixbuf(self, img: np.ndarray) -> GdkPixbuf.Pixbuf:
+        """Returns a new GdkPixbuf showing linear working data as display-referred sRGB.
+
+        Args:
+            img: Linear 0-1 RGB image.
+
+        Returns:
+            The pixbuf.
+        """
+        return self.createPixbuf(self.video.displayImage(img))
+
+    @staticmethod
+    def toUint8(img: np.ndarray) -> np.ndarray:
+        """Quantizes a 0-1 image to uint8, for previews that aren't color.
+
+        Args:
+            img: The image.
+
+        Returns:
+            The uint8 image.
+        """
+        return np.around(np.clip(a=img, a_min=0, a_max=1)*255).astype(np.uint8)
     
     def updatePreview(self, dialog: Gtk.FileChooser) -> None:
         """Shows a thumbnail of the file selected in the file chooser, or hides the preview.
@@ -357,12 +396,12 @@ class UI:
         pixbuf = None
         if(path != None and os.path.isfile(path)):
             try:
-                source = FrameSource.open(path)
+                video = Video.open(path)
                 try:
-                    img = Video(source).thumbnail()
+                    img = video.thumbnailPreview()
                 finally:
-                    source.close()
-                pixbuf = self.createPixbuf(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                    video.source.close()
+                pixbuf = self.createPixbuf(img)
             except Exception:
                 pass
         if(pixbuf is not None):
@@ -406,7 +445,7 @@ class UI:
             paths: The chosen files.
         """
         try:
-            source = FrameSource.open(paths[0] if len(paths) == 1 else paths)
+            video = Video.open(paths[0] if len(paths) == 1 else paths)
         except ValueError as error:
             message = str(error)
             def showError() -> None:
@@ -415,64 +454,56 @@ class UI:
                 self.enableUI()
             GLib.idle_add(showError)
             return
-        frameCount = source.frameCount()
+        frameCount = video.source.frameCount()
         def load() -> None:
             """Loads the source: one frame goes straight to Process, more go through Align and Stack."""
             if(frameCount == 1):
-                self.loadSingleFrame(source)
+                self.loadSingleFrame(video)
             else:
-                self.loadFrames(source)
+                self.loadFrames(video)
         GLib.idle_add(load)
 
-    def loadFrames(self, source: FrameSource) -> None:
-        """Starts loading a source of several frames to align and stack. finishedVideo is called when it's done.
+    def loadFrames(self, video: Video) -> None:
+        """Starts loading a video of several frames to align and stack. finishedVideo is called when it's done.
 
         Args:
-            source: The source.
+            video: The video.
         """
         try:
-            g.source = source
-            self.video = Video(source)
+            g.source = video.source
+            self.video = video
+            self.updateDemosaicChoices()
             self.video.checkMemory()
             thread = Thread(target=self.video.run, args=())
             thread.start()
         except MemoryError:
             self.enableUI()
 
-    def loadSingleFrame(self, source: FrameSource) -> None:
-        """Loads a source of one frame straight into the Process tab.
+    def loadSingleFrame(self, video: Video) -> None:
+        """Loads a video of one frame straight into the Process tab.
 
         Args:
-            source: The source.
+            video: The video.
         """
-        g.source = source
+        g.source = video.source
         try:
-            self.video = Video(source)
-            g.guessedColorMode = self.video.guessColorMode()
+            self.video = video
+            self.updateDemosaicChoices()
             self.video.checkMemory()
 
             self.window.set_title(self.sourceTitle() + " - " + UI.TITLE)
             self.saveDialog.set_current_name("")
 
-            self.updateAutoColorModeText()
-
             self.stack = None
-            self.process = Process(self.video.getFrame(index=0,
-                                                       colorMode=g.actualColor()))
+            self.process = Process(self.video.getFrame(index=0))
+            self.applyAutoBlackLevel()
             self.builder.get_object("alignTab").set_sensitive(False)
             self.builder.get_object("stackTab").set_sensitive(False)
             self.builder.get_object("processTab").set_sensitive(True)
             self.tabs.set_current_page(UI.PROCESS_TAB)
 
-            img = cv2.cvtColor(
-                self.video.getFrame(
-                    index=0,
-                    colorMode=g.actualColor(),
-                    toDtype=np.uint8,
-                ),
-                cv2.COLOR_BGR2RGB,
-            )
-            pixbuf = self.createPixbuf(img)
+            img = cv2.cvtColor(self.video.getFrame(index=0), cv2.COLOR_BGR2RGB)
+            pixbuf = self.createDisplayPixbuf(img)
             self.frame.set_from_pixbuf(pixbuf.copy())
         except MemoryError:
             pass
@@ -507,28 +538,30 @@ class UI:
             response = self.saveDialog.run()
             if(response == Gtk.ResponseType.OK):
                 fileName = self.saveDialog.get_filename()
+                bits = 16 if self.bitDepth.get_active_id() == "1" else 8
+                if(not fileName.lower().endswith(Video.SAVE_EXTENSIONS)):
+                    self.saveDialog.hide()
+                    self.showErrorDialog("Only .png, .jpg/.jpeg and .tif/.tiff files are supported")
+                    start()
+                    return
+                if(bits == 16 and fileName.lower().endswith((".jpg", ".jpeg"))):
+                    self.saveDialog.hide()
+                    self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
+                    start()
+                    return
                 try:
                     while(self.processThread != None and self.processThread.is_alive()):
                         time.sleep(0.1) # Make sure the file isn't still being processed
-                    bitDepth = self.bitDepth.get_active_text()
-                    if(bitDepth == "8-bit"):
-                        cv2.imwrite(fileName, cv2.cvtColor(np.around(self.process.finalImage*255).astype('uint8'), cv2.COLOR_RGB2BGR))
-                    elif(bitDepth == "16-bit"):
-                        if(fileName.endswith(".png") or fileName.endswith(".tif") or fileName.endswith(".tiff")):
-                            cv2.imwrite(fileName, cv2.cvtColor(np.around(self.process.finalImage*65535).astype('uint16'), cv2.COLOR_RGB2BGR))
-                        else:
-                            self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
-                            start()
-                except: # Save Failed
-                    self.showErrorDialog("There was an error saving the image, make sure it is a valid file extension.")
+                    self.video.save(path=fileName, img=self.process.finalImage, bits=bits)
+                except Exception as error: # Save Failed
+                    print(error)
+                    self.showErrorDialog("There was an error saving the image.")
         start()
         self.saveDialog.hide()
         
     def finishedVideo(self) -> None:
         """Handler for when the frames finish loading; prepares and moves on to the Align tab."""
         def update():
-            self.tabs.next_page()
-           
             self.frameScale.set_sensitive(True)
            
             self.startFrame.set_lower(0)
@@ -546,7 +579,6 @@ class UI:
             g.reference = self.video.sharpest
             self.frameSlider.set_value(self.video.sharpest)
 
-            self.updateAutoColorModeText()
             self.setReference()
             self.setStartFrame()
             self.setEndFrame()
@@ -557,6 +589,9 @@ class UI:
                     "Not all images were added to the stack.  "
                     "Make sure they are all the same dimensions."
                 )
+            if(self.video.descriptionMismatch):
+                self.showErrorDialog("Not all images have the same color tags.  "
+                                     "Every image is decoded like the first one.")
             self.window.set_title(self.sourceTitle() + " - " + UI.TITLE)
             self.saveDialog.set_current_name("")
 
@@ -564,6 +599,7 @@ class UI:
             self.builder.get_object("stackTab").set_sensitive(False)
             self.builder.get_object("processTab").set_sensitive(False)
             self.stack = None
+            self.tabs.next_page()
         GLib.idle_add(update)
         
     def openPSF(self, *args: object) -> None:
@@ -584,36 +620,127 @@ class UI:
                 self.showErrorDialog("There was an error opening the PSF, make sure it is a valid image.  The PSF should be no larger than 100x100.")
             self.processImage(self.builder.get_object("deconvolveCustomFile"))
        
-    # Updates the Auto color mode text     
-    def updateAutoColorModeText(self):
-        colorMode = self.colorMode.get_active()
-        self.colorMode.remove(0)
-        if(g.guessedColorMode == Video.COLOR_RGB):
-            self.colorMode.prepend_text("Auto (RGB)")
-        elif(g.guessedColorMode == Video.COLOR_GRAYSCALE):
-            self.colorMode.prepend_text("Auto (Grayscale)")
-        elif(g.guessedColorMode == Video.COLOR_RGGB):
-            self.colorMode.prepend_text("Auto (RGGB)")
-        elif(g.guessedColorMode == Video.COLOR_GRBG):
-            self.colorMode.prepend_text("Auto (GRBG)")
-        elif(g.guessedColorMode == Video.COLOR_GBRG):
-            self.colorMode.prepend_text("Auto (GBRG)")
-        elif(g.guessedColorMode == Video.COLOR_BGGR):
-            self.colorMode.prepend_text("Auto (BGGR)")
-        elif(g.guessedColorMode == Video.COLOR_RGGB_VNG):
-            self.colorMode.prepend_text("Auto (RGGB VNG)")
-        elif(g.guessedColorMode == Video.COLOR_GRBG_VNG):
-            self.colorMode.prepend_text("Auto (GRBG VNG)")
-        elif(g.guessedColorMode == Video.COLOR_GBRG_VNG):
-            self.colorMode.prepend_text("Auto (GBRG VNG)")
-        elif(g.guessedColorMode == Video.COLOR_BGGR_VNG):
-            self.colorMode.prepend_text("Auto (BGGR VNG)")
-        if(colorMode == Video.COLOR_AUTO):
-            self.colorMode.set_active(0)
-        
+    def updateDemosaicChoices(self) -> None:
+        """Resolves the demosaic choice for the loaded video, and shows it in the three drop-downs.
+
+        Every option is listed. Before a video is loaded every option is offered; after, the ones the video doesn't
+        support are greyed out, a choice of one reverts to Auto, and the Auto items show what was resolved.
+        """
+        modes = list(DemosaicMode)
+        patterns = [None, MosaicPattern.RGGB, MosaicPattern.GRBG, MosaicPattern.GBRG, MosaicPattern.BGGR]
+        algorithms = [None] + [algorithm for algorithm in DemosaicAlgorithm if algorithm != DemosaicAlgorithm.UNSPECIFIED]
+        supported = (modes, patterns, algorithms)
+        autoTexts = ["Auto"]*3
+        if(self.video is not None):
+            supported = (self.video.supportedDemosaicModes(),
+                         self.video.supportedMosaicPatterns(),
+                         self.video.supportedDemosaicAlgorithms())
+            for field, name, usable, auto in zip(("demosaicMode", "mosaicPattern", "demosaicAlgorithm"),
+                                                 ("demosaic mode", "mosaic pattern", "demosaic algorithm"),
+                                                 supported,
+                                                 (DemosaicMode.AUTO, None, None)):
+                if(getattr(g, field) not in usable):
+                    print(f"The {name} {getattr(g, field).value} isn't supported by this input, using Auto")
+                    setattr(g, field, auto)
+            remembered = Video.rememberedPattern()
+            autoIntent = self.video.setDemosaic(
+                mode=DemosaicMode.AUTO,
+                pattern=None,
+                algorithm=None,
+                rememberedPattern=remembered,
+            )
+            g.demosaicIntent = autoIntent
+            if(g.demosaicMode != DemosaicMode.AUTO):
+                g.demosaicIntent = self.video.setDemosaic(
+                    mode=g.demosaicMode,
+                    pattern=g.mosaicPattern,
+                    algorithm=g.demosaicAlgorithm,
+                    rememberedPattern=remembered,
+                )
+            shown = autoIntent or g.demosaicIntent
+            autoTexts = ["Auto (Off)"]*3
+            if(g.demosaicIntent is not None):
+                autoTexts = ["Auto (On)", f"Auto ({shown.pattern.value})", f"Auto ({shown.algorithm.value})"]
+            elif(autoIntent is not None):
+                autoTexts[0] = "Auto (On)"
+        # Pattern and Algorithm only apply under On
+        enabled = g.demosaicMode == DemosaicMode.ON
+        self.demosaicModes = modes
+        self.mosaicPatterns = patterns
+        self.demosaicAlgorithms = algorithms
+        self.updatingDemosaic = True
+        try:
+            for combo, choices, usable, autoText, value, active in (
+                (self.demosaicMode, modes, supported[0], autoTexts[0], g.demosaicMode, True),
+                (self.mosaicPattern, patterns, supported[1], autoTexts[1], g.mosaicPattern, enabled),
+                (self.demosaicAlgorithm, algorithms, supported[2], autoTexts[2], g.demosaicAlgorithm, enabled),
+            ):
+                self.supportedDemosaicRows[combo] = {choices.index(choice) for choice in usable}
+                combo.remove_all()
+                combo.append_text(autoText)
+                for choice in choices[1:]:
+                    combo.append_text(choice.value)
+                combo.set_active(choices.index(value) if active else 0)
+                combo.set_sensitive(active)
+        finally:
+            self.updatingDemosaic = False
+
+    def greyUnsupportedDemosaic(
+        self,
+        combo: Gtk.ComboBox,
+        cell: Gtk.CellRenderer,
+        model: Gtk.TreeModel,
+        iter: Gtk.TreeIter,
+        *data: object,
+    ) -> None:
+        """Cell data function of the demosaic drop-downs: greys out the choices the loaded video doesn't support.
+
+        Args:
+            combo: The drop-down.
+            cell: Its text cell.
+            model: Its items.
+            iter: The item being drawn.
+            *data: Unused.
+        """
+        cell.set_property("sensitive", model.get_path(iter)[0] in self.supportedDemosaicRows.get(combo, ()))
+
+    def setDemosaicMode(self, *args: object) -> None:
+        """Handler for the Demosaic drop-down: uses the choice and updates the preview.
+
+        Args:
+            *args: The signal's arguments, unused.
+        """
+        if(not self.updatingDemosaic):
+            g.demosaicMode = self.demosaicModes[self.demosaicMode.get_active()]
+            self.updateDemosaicChoices()
+            self.updateImage()
+
+    def setMosaicPattern(self, *args: object) -> None:
+        """Handler for the Pattern drop-down: uses the choice, remembers an explicit one and updates the preview.
+
+        Args:
+            *args: The signal's arguments, unused.
+        """
+        if(not self.updatingDemosaic):
+            g.mosaicPattern = self.mosaicPatterns[self.mosaicPattern.get_active()]
+            if(g.mosaicPattern is not None):
+                self.preferences.set("bayerGuess", g.mosaicPattern.value)
+            self.updateDemosaicChoices()
+            self.updateImage()
+
+    def setDemosaicAlgorithm(self, *args: object) -> None:
+        """Handler for the Algorithm drop-down: uses the choice and updates the preview.
+
+        Args:
+            *args: The signal's arguments, unused.
+        """
+        if(not self.updatingDemosaic):
+            g.demosaicAlgorithm = self.demosaicAlgorithms[self.demosaicAlgorithm.get_active()]
+            self.updateDemosaicChoices()
+            self.updateImage()
+
     # Called when the tab is changed.  Updates parts of the UI based on the tab
     def changeTab(self, notebook, page, page_num, user_data=None):
-        self.colorMode.set_sensitive(True)
         if((page_num == UI.LOAD_TAB or page_num == UI.ALIGN_TAB) and self.video is not None):
             self.setStartFrame()
             self.setEndFrame()
@@ -629,7 +756,6 @@ class UI:
             self.updateImage(None, page_num)
         elif(page_num == UI.PROCESS_TAB and self.process is not None):
             self.frameScale.hide()
-            self.colorMode.set_sensitive(False)
             self.processImage()
         self.fixFrameSliderBug()
     
@@ -648,12 +774,13 @@ class UI:
             videoIndex = int(self.frameSlider.get_value())
             if(len(self.video.frames) == 0):
                 # Single Image
-                img = cv2.cvtColor(self.video.getFrame(index=0, colorMode=g.actualColor()), cv2.COLOR_BGR2RGB)
+                img = cv2.cvtColor(self.video.getFrame(index=0), cv2.COLOR_BGR2RGB)
             else:
                 # Video/Sequence
                 videoIndex = min(videoIndex, len(self.video.frames)-1)
-                img = cv2.cvtColor(self.video.getFrame(self.video.frames[videoIndex], g.actualColor()),
-                                   cv2.COLOR_BGR2RGB)
+                img = cv2.cvtColor(self.video.getFrame(self.video.frames[videoIndex]), cv2.COLOR_BGR2RGB)
+            # Previews are shown in display values
+            img = self.video.displayEncode(img)
                 
             height, width = img.shape[:2]
             
@@ -686,7 +813,7 @@ class UI:
                     C[1][2] = -C[1][2]
                 img = cv2.warpAffine(img, C, (width, height), flags=cv2.INTER_NEAREST)
 
-            pixbuf = self.createPixbuf((img*255).astype(np.uint8))
+            pixbuf = self.createPixbuf(UI.toUint8(img))
             self.frame.set_from_pixbuf(pixbuf.copy())
         elif(page_num == UI.STACK_TAB and self.stack is not None):
             if(int(self.frameSlider.get_value()) >= len(self.stack.tmats)):
@@ -694,19 +821,15 @@ class UI:
             tmat = self.stack.tmats[int(self.frameSlider.get_value())]
             videoIndex = tmat[0]
             M = tmat[1]
-            img = self.video.getFrame(
-                index=videoIndex,
-                colorMode=g.actualColor(),
-                toDtype=np.uint8,
-            )
+            img = self.video.getFrame(videoIndex)
             if(g.autoCrop):
-                ref = (self.stack.refBG*255).astype(np.uint8)
+                ref = self.stack.refBG
             else:
                 ref = None
             img = transform(img, ref, M, self.align.minX, self.align.maxX, self.align.minY, self.align.maxY, g)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            pixbuf = self.createPixbuf(img)
+            pixbuf = self.createDisplayPixbuf(img)
             self.frame.set_from_pixbuf(pixbuf.copy())
             self.updateQualityImage()
             
@@ -896,7 +1019,7 @@ class UI:
         self.psfImage.set_from_pixbuf(pixbuf.copy())
     
     # Updates the RGB histogram of the final image    
-    def updateHistogram(self):
+    def updateHistogram(self) -> None:
         allocation = self.builder.get_object("processTab").get_allocation()
         width = max(250, allocation.width-1)
         padding = 5
@@ -904,8 +1027,9 @@ class UI:
         bins = np.arange(256).reshape(256, 1)
         
         color = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+        displayed = self.video.displayImage(self.process.finalImage)
         for i, col in enumerate(color):
-            hist = np.log(cv2.calcHist([np.around(self.process.finalImage*255).astype('uint8')],[i],None,[256],[0,256]) + 1)
+            hist = np.log(cv2.calcHist([displayed],[i],None,[256],[0,256]) + 1)
             cv2.normalize(hist, hist, 0, 99, cv2.NORM_MINMAX)
             hist = 99 - hist
             hist = np.int32(np.around(hist))
@@ -920,7 +1044,7 @@ class UI:
     # Sets the reference frame to the current visible frame
     def setReference(self, *args: object) -> None:
         g.reference = str(int(self.frameSlider.get_value()))
-        self.reference = self.video.getFrame(self.video.frames[int(g.reference)], g.actualColor())
+        self.reference = self.video.getFrame(self.video.frames[int(g.reference)])
         self.builder.get_object("referenceLabel").set_text(g.reference)
         self.builder.get_object("alignButton").set_sensitive(True)
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
@@ -947,7 +1071,7 @@ class UI:
             # Reference is outside of the range, fix it
             g.reference = str(int(g.startFrame))
             self.builder.get_object("referenceLabel").set_text(g.reference)
-            self.reference = self.video.getFrame(self.video.frames[int(g.reference)], g.actualColor())
+            self.reference = self.video.getFrame(self.video.frames[int(g.reference)])
         self.fixFrameSliderBug()
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
             self.updateImage()
@@ -962,7 +1086,7 @@ class UI:
             # Reference is outside of the range, fix it
             g.reference = str(int(g.endFrame))
             self.builder.get_object("referenceLabel").set_text(g.reference)
-            self.reference = self.video.getFrame(self.video.frames[int(g.reference)], g.actualColor())
+            self.reference = self.video.getFrame(self.video.frames[int(g.reference)])
         self.fixFrameSliderBug()
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
             self.updateImage()
@@ -1075,21 +1199,6 @@ class UI:
     # Sets whether or not to align channels separately
     def setAlignChannels(self, *args):
         g.alignChannels = self.alignChannels.get_active()
-    
-    # Sets the color mode of the input
-    def setColorMode(self, *args):
-        if(self.colorMode.is_sensitive()):
-            g.colorMode = self.colorMode.get_active()
-            if(g.colorMode == Video.COLOR_RGGB or
-               g.colorMode == Video.COLOR_GRBG or
-               g.colorMode == Video.COLOR_GRBG or
-               g.colorMode == Video.COLOR_BGGR or
-               g.colorMode == Video.COLOR_RGGB_VNG or
-               g.colorMode == Video.COLOR_GRBG_VNG or
-               g.colorMode == Video.COLOR_GRBG_VNG or
-               g.colorMode == Video.COLOR_BGGR_VNG):
-                self.preferences.set("bayerGuess", g.colorMode)
-            self.updateImage()
     
     def setDriftType(self, *args):
         g.driftType = self.driftType.get_active()
@@ -1224,6 +1333,7 @@ class UI:
     def finishedStack(self):
         def update():
             self.process = Process(self.stack.stackedImage)
+            self.applyAutoBlackLevel()
             self.tabs.next_page()
             self.enableUI()
             self.builder.get_object("alignTab").set_sensitive(True)
@@ -1231,9 +1341,29 @@ class UI:
             self.builder.get_object("processTab").set_sensitive(True)
         GLib.idle_add(update)
         
+    def setAutoBlackLevel(self, *args: object) -> None:
+        """Locks the black level slider to the automatic black level while Auto is on, and reprocesses."""
+        auto = self.builder.get_object("autoBlackLevel").get_active()
+        self.builder.get_object("blackLevel").set_sensitive(not auto)
+        if(auto and self.process is not None):
+            self.builder.get_object("blackLevelAdjust").set_value(100*positionFromBlackLevel(self.process.autoBlackLevel))
+
+    def applyAutoBlackLevel(self) -> None:
+        """Moves the black level slider to a new image's automatic black level, if Auto is on, without reprocessing.
+
+        The new image is processed in full when the Process tab is shown, which reads the slider.
+        """
+        if(not self.builder.get_object("autoBlackLevel").get_active()):
+            return
+        self.settingBlackLevel = True
+        try:
+            self.builder.get_object("blackLevelAdjust").set_value(100*positionFromBlackLevel(self.process.autoBlackLevel))
+        finally:
+            self.settingBlackLevel = False
+
     # Processes the final Stacked image
     def processImage(self, *args: object) -> None:
-        if(g.source is None):
+        if(g.source is None or self.settingBlackLevel):
             return
         self.processSpinner.start()
         self.processSpinner.show()
@@ -1269,7 +1399,7 @@ class UI:
         g.deringBlend = int(self.builder.get_object("deringBlendAdjust").get_value())
         
         g.gamma = self.builder.get_object("gammaAdjust").get_value()
-        g.blackLevel = self.builder.get_object("blackLevelAdjust").get_value()
+        g.blackLevel = blackLevelFromPosition(self.builder.get_object("blackLevelAdjust").get_value()/100)
         g.value = self.builder.get_object("valueAdjust").get_value()
         
         g.redAdjust = self.builder.get_object("redAdjust").get_value()
@@ -1333,8 +1463,7 @@ class UI:
             if(self.stack is not None):
                 self.process = Process(self.stack.stackedImage)
             else:
-                self.process = Process(self.video.getFrame(index=0,
-                                                           colorMode=g.actualColor()))
+                self.process = Process(self.video.getFrame(index=0))
         if(self.processThread != None and self.processThread.is_alive()):
             self.process.processAgain = processAgain
             self.process.processDeblurAgain = processDeblur
@@ -1346,12 +1475,13 @@ class UI:
         self.updatePSFImage(args)
     
     # Called when processing is complete
-    def finishedProcessing(self, *args):
+    def finishedProcessing(self, *args) -> None:
         def update():
             if(self.showMask.get_active() and self.process.thresh is not None):
-                pixbuf = self.createPixbuf(np.around(self.process.thresh*255).astype('uint8'))
+                # The mask isn't light, so it is shown as it is
+                pixbuf = self.createPixbuf(UI.toUint8(self.process.thresh))
             else:
-                pixbuf = self.createPixbuf(np.around(self.process.finalImage*255).astype('uint8'))
+                pixbuf = self.createDisplayPixbuf(self.process.finalImage)
             self.frame.set_from_pixbuf(pixbuf.copy())
             self.updateHistogram()
             self.processSpinner.stop()

@@ -76,8 +76,7 @@ class Stack:
 
         self.stackedImage /= g.limit
         
-        # Make sure there wasn't any overshoot from the transformations
-        self.stackedImage[self.stackedImage>1] = 1
+        # Make sure there wasn't any undershoot from the transformations. Values above white are kept for Process.
         self.stackedImage[self.stackedImage<0] = 0
         self.stackedImage = self.stackedImage.astype(np.float32)
         
@@ -106,13 +105,14 @@ class Stack:
         self.refBG = transform(ref, None, M,
                                0, 0, 0, 0, g)
         
-    # Aligns the RGB channels to help reduce chromatic aberrations
-    def alignChannels(self, progress):
+    # Aligns the RGB channels to help reduce chromatic aberrations, registering gamma 2.2 copies
+    def alignChannels(self, progress: ProgressBar) -> None:
         h, w = self.stackedImage.shape[:2]
-        gray = cv2.cvtColor(self.stackedImage, cv2.COLOR_BGR2GRAY)
+        encoded = Video.measurementCopy(self.stackedImage)
+        gray = cv2.cvtColor(encoded, cv2.COLOR_BGR2GRAY)
         sr = pystackreg.StackReg(Align.TRANSLATION)
         
-        for i, C in enumerate(cv2.split(self.stackedImage)):
+        for i, C in enumerate(cv2.split(encoded)):
             M = sr.register(C, gray)
             M = np.delete(M, 2, 0)
             self.stackedImage[:,:,i] = cv2.warpAffine(self.stackedImage[:,:,i], M, (w, h), borderMode=cv2.BORDER_REPLICATE)
@@ -127,10 +127,10 @@ def blendAverage(frames: list[np.ndarray],
                  maxY: int,
                  progress: ProgressCounter,
                  gCopy: Object) -> np.ndarray | None:
-    video = Video(gCopy.source)
+    video = Video(source=gCopy.source, intent=gCopy.demosaicIntent)
     stackedImage = None
     for c, (frame, M, diff, sharp) in enumerate(frames):
-        image = video.getFrame(frame, gCopy.actualColor())
+        image = video.getFrame(frame)
         image = transform(image, ref, M, 
                           minX, maxX, minY, maxY, gCopy).astype(np.float64)
         if stackedImage is None:
