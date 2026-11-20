@@ -36,7 +36,7 @@
     </child>
   </object>
   <object class="GtkAdjustment" id="blackLevelAdjust">
-    <property name="upper">255</property>
+    <property name="upper">100</property>
     <property name="step-increment">1</property>
     <signal name="value-changed" handler="processImage" swapped="no"/>
   </object>
@@ -489,10 +489,12 @@
       <pattern>*.jpg</pattern>
       <pattern>*.jpeg</pattern>
       <pattern>*.png</pattern>
+      <pattern>*.tif</pattern>
       <pattern>*.tiff</pattern>
       <pattern>*.JPG</pattern>
       <pattern>*.JPEG</pattern>
       <pattern>*.PNG</pattern>
+      <pattern>*.TIF</pattern>
       <pattern>*.TIFF</pattern>
     </patterns>
   </object>
@@ -559,8 +561,8 @@
                 <property name="active">0</property>
                 <property name="active-id">0</property>
                 <items>
-                  <item id="0" translatable="yes">8-bit</item>
-                  <item id="1" translatable="yes">16-bit</item>
+                  <item id="0" translatable="yes">8-bit sRGB</item>
+                  <item id="1" translatable="yes">16-bit sRGB</item>
                 </items>
               </object>
               <packing>
@@ -2777,16 +2779,48 @@ Note: Drift adjustment will still crop the image.</property>
                                           </packing>
                                         </child>
                                         <child>
-                                          <object class="GtkScale" id="blackLevel">
+                                          <!-- The Auto toggle shares the slider's column, so the histogram spanning the grid fits the tab.
+                                               The box doesn't expand, so the panel never gets wider than it asks: the histogram is drawn
+                                               as wide as the panel, which would then widen it again. -->
+                                          <object class="GtkBox">
                                             <property name="width-request">275</property>
                                             <property name="visible">True</property>
-                                            <property name="can-focus">True</property>
+                                            <property name="can-focus">False</property>
+                                            <property name="hexpand">False</property>
                                             <property name="margin-top">10</property>
-                                            <property name="adjustment">blackLevelAdjust</property>
-                                            <property name="round-digits">0</property>
-                                            <property name="digits">0</property>
-                                            <property name="value-pos">left</property>
-                                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                                            <child>
+                                              <object class="GtkScale" id="blackLevel">
+                                                <property name="visible">True</property>
+                                                <property name="can-focus">True</property>
+                                                <property name="hexpand">True</property>
+                                                <property name="adjustment">blackLevelAdjust</property>
+                                                <property name="round-digits">3</property>
+                                                <property name="digits">1</property>
+                                                <property name="value-pos">left</property>
+                                                <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                                              </object>
+                                              <packing>
+                                                <property name="expand">True</property>
+                                                <property name="fill">True</property>
+                                                <property name="position">0</property>
+                                              </packing>
+                                            </child>
+                                            <child>
+                                              <object class="GtkCheckButton" id="autoBlackLevel">
+                                                <property name="label" translatable="yes">Auto</property>
+                                                <property name="visible">True</property>
+                                                <property name="can-focus">True</property>
+                                                <property name="receives-default">False</property>
+                                                <property name="tooltip-text" translatable="yes">Sets the black level to the one the file states, or else to an estimate from the image's darkest areas.</property>
+                                                <property name="draw-indicator">True</property>
+                                                <signal name="toggled" handler="setAutoBlackLevel" swapped="no"/>
+                                              </object>
+                                              <packing>
+                                                <property name="expand">False</property>
+                                                <property name="fill">True</property>
+                                                <property name="position">1</property>
+                                              </packing>
+                                            </child>
                                           </object>
                                           <packing>
                                             <property name="left-attach">1</property>

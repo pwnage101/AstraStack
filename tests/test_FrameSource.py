@@ -1,24 +1,37 @@
 """Tests for FrameSource.py."""
-import os
 import pickle
-import tempfile
+import struct
 import unittest
 from collections.abc import Sequence
+from types import SimpleNamespace
 from unittest import mock
 
 import cv2
 import ddt
 import numpy as np
+import pytest
 
+import ColorSpace
 from Constants import AUTO, UNSPECIFIED, DemosaicAlgorithm, DemosaicMode, DemosaicParams, MosaicPattern
-from FrameSource import CameraRawSource, FrameSource, ImageSequenceSource, OpenCVDemosaicSource, VideoSource
+from FrameSource import (
+    CameraRawSource,
+    FitsSource,
+    FrameSource,
+    ImageSequenceSource,
+    LinearizeParams,
+    OpenCVDemosaicSource,
+    VideoSource,
+    linearize,
+)
 from tests.inputs import (
+    AVI8_PAL8,
     AVI8_RGGB,
     DNG16_RGGB_SEQUENCE,
     DNG16_RGGB_SEQUENCE_DIMENSIONS,
     DROPPED_FRAMES_AVI,
     FITS16_RGGB_SEQUENCE,
     FITS16_RGGB_SEQUENCE_DIMENSIONS,
+    INPUTS_DIR,
     JPG8,
     JPG8_DIMENSIONS,
     JPG8_NIKON,
@@ -57,7 +70,8 @@ class TestImageSequenceSource(unittest.TestCase):
         source = ImageSequenceSource(PNG8_SEQUENCE)
 
         for index in [2, 0, 3, 1, 1, 2]:
-            assert np.array_equal(source.readStored(index), cv2.imread(PNG8_SEQUENCE[index], cv2.IMREAD_UNCHANGED))
+            assert np.array_equal(source.readStored(index).image,
+                                  cv2.imread(PNG8_SEQUENCE[index], cv2.IMREAD_UNCHANGED))
 
     @ddt.data(
         # An 8-bit PNG reads as 8 bits.
@@ -66,15 +80,13 @@ class TestImageSequenceSource(unittest.TestCase):
         {"path": PNG16, "dtype": np.uint16},
         # An 8-bit JPEG reads as 8 bits.
         {"path": JPG8, "dtype": np.uint8},
-        # A raw camera file is decoded to 16 bits.
-        {"path": DNG16_RGGB_SEQUENCE[0], "dtype": np.uint16},
     )
     @ddt.unpack
-    def test_readFrame_color_native_depth(self, path: str, dtype: type) -> None:
+    def test_readStored_color_native_depth(self, path: str, dtype: type) -> None:
         """Color frames are read with three channels at their stored depth, and frameSize agrees with them."""
-        source = FrameSource.open([path])
+        source = ImageSequenceSource([path])
 
-        frame = source.readFrame(0)
+        frame = source.readStored(0).image
 
         assert frame.dtype == dtype
         assert frame.ndim == 3 and frame.shape[2] == 3
@@ -87,12 +99,12 @@ class TestImageSequenceSource(unittest.TestCase):
     def test_pickles(self) -> None:
         """A source survives a pickle round trip and reads the same frames."""
         source = ImageSequenceSource(PNG8_SEQUENCE)
-        before = source.readStored(1)
+        before = source.readStored(1).image
 
         source = pickle.loads(pickle.dumps(source))
 
         assert source.paths == PNG8_SEQUENCE
-        assert np.array_equal(source.readStored(1), before)
+        assert np.array_equal(source.readStored(1).image, before)
 
 
 @ddt.ddt
@@ -111,7 +123,7 @@ class TestVideoSource(unittest.TestCase):
         """
         source = VideoSource(path)
         try:
-            return [source.readStored(index) for index in range(source.frameCount())]
+            return [source.readStored(index).image for index in range(source.frameCount())]
         finally:
             source.close()
 
@@ -125,23 +137,24 @@ class TestVideoSource(unittest.TestCase):
     def test_frameCount_is_counted_once(self) -> None:
         """The frames are counted once, the first time the count is needed."""
         source = VideoSource(MP4_YUV8)
-        assert source.times is None
+        assert source.timestamps is None
         # Reading just the first frame does not trigger a full read. This
         # behavior is what makes thumbnail generation quick.
         source.readStored(0)
-        assert source.times is None
+        assert source.timestamps is None
 
         assert source.frameCount() == MP4_YUV8_FRAME_COUNT
+        source.close()
         source.path = "missing.avi"
         assert source.frameCount() == MP4_YUV8_FRAME_COUNT
 
     def test_readStored_in_any_order(self) -> None:
         """Frames are read in any order and repeatedly."""
         source = VideoSource(MP4_YUV8)
-        sequential = [source.readStored(index) for index in range(source.frameCount())]
+        sequential = [source.readStored(index).image for index in range(source.frameCount())]
 
         for index in [0, 1, 2, 40, 3, 59, 0, 40, 40, 2, 3]:
-            assert np.array_equal(source.readStored(index), sequential[index]), index
+            assert np.array_equal(source.readStored(index).image, sequential[index]), index
 
     def test_readStored_past_end(self) -> None:
         """There is no frame past the end of the video, whether read in order or by seeking."""
@@ -152,19 +165,28 @@ class TestVideoSource(unittest.TestCase):
         assert source.readStored(MP4_YUV8_FRAME_COUNT) is None
         assert VideoSource(MP4_YUV8).readStored(MP4_YUV8_FRAME_COUNT) is None
 
+    def test_palette_video_after_seeks(self) -> None:
+        """A palette video's frames keep their palette when read after a seek, as OpenCV decodes them."""
+        capture = cv2.VideoCapture(AVI8_PAL8)
+        expectedFrames = [capture.read()[1].astype(np.uint16)*257 for _ in range(3)]
+        capture.release()
+        source = VideoSource(AVI8_PAL8)
+        for index in (2, 0, 1):
+            assert np.array_equal(source.readStored(index).image, expectedFrames[index]), f"frame {index} is wrong"
+
     def test_pickles_without_capture(self) -> None:
-        """An open source pickles as its path and frame times, and the copy reads the same frames in any order."""
+        """An open source pickles as its path and timestamps, and the copy reads the same frames in any order."""
         source = VideoSource(MP4_YUV8)
-        sequential = [source.readStored(index) for index in range(source.frameCount())]
-        times = source.times
+        sequential = [source.readStored(index).image for index in range(source.frameCount())]
+        timestamps = source.timestamps
 
         source = pickle.loads(pickle.dumps(source))
 
         assert source.path == MP4_YUV8
-        assert source.times == times
-        assert source._capture is None
+        assert source.timestamps == timestamps
+        assert source.container is None
         for index in [2, 0, 5, 5, 3, 1, 4]:
-            assert np.array_equal(source.readStored(index), sequential[index])
+            assert np.array_equal(source.readStored(index).image, sequential[index])
 
     @ddt.data(
         # The first read is frame 1, which used to read frame 0.
@@ -187,7 +209,7 @@ class TestVideoSource(unittest.TestCase):
         source = pickle.loads(pickle.dumps(source))
 
         for index in order:
-            assert np.array_equal(source.readStored(index), expectedFrames[index]), index
+            assert np.array_equal(source.readStored(index).image, expectedFrames[index]), index
 
     def test_dropped_frames_avi_is_missing_frames(self) -> None:
         """Make sure the dropped frames test video has gaps.
@@ -212,8 +234,8 @@ class TestVideoSource(unittest.TestCase):
     def test_reads_correct_frame_however_reached(self, path: str) -> None:
         """A video always fetches the correct frame no matter where we start.
 
-        OpenCV doesn't always land on the frame it seeks to, but our VideoSource wraps OpenCV
-        and is designed to work around OpenCV's limitations.
+        Seeking doesn't always land on the frame asked for, so VideoSource seeks to an earlier
+        keyframe and decodes forward from it.
 
         Check that it works by seeking to many points in the video and doing many
         different lengths of sequential reads. This hopefully simulates both a user
@@ -252,7 +274,7 @@ class TestVideoSource(unittest.TestCase):
         # pickle + unpickle the VideoSource to simulate being passed into a worker process.
         source = pickle.loads(pickle.dumps(source))
         actualFrames = [
-            (name, index, source.readStored(index))
+            (name, index, source.readStored(index).image)
             for name, run in runs for index in run
         ]
 
@@ -278,7 +300,7 @@ class TestOpen(unittest.TestCase):
          "expected_frame_size": JPG8_DIMENSIONS},
         # A single FITS file, which OpenCV can't read.
         {"path": FITS16_RGGB_SEQUENCE[0],
-         "expected_class": ImageSequenceSource,
+         "expected_class": FitsSource,
          "expected_frame_count": 1,
          "expected_frame_size": FITS16_RGGB_SEQUENCE_DIMENSIONS},
         # A single raw camera file.
@@ -346,12 +368,30 @@ class TestOpen(unittest.TestCase):
         assert source.readFrame(0) is not None
 
     @ddt.data(
+        # An untagged image sequence.
+        {"path": PNG8_SEQUENCE},
+        # An untagged video.
+        {"path": MP4_YUV8},
+    )
+    @ddt.unpack
+    def test_firstFrameFacts_describes_the_source(self, path: str | list[str]) -> None:
+        """A source is described like its first frame, and untagged images and videos state no Bayer pattern."""
+        source = FrameSource.open(path)
+        frame = source.readStored(0)
+
+        assert source.firstFrameFacts.linearizeParams == frame.linearizeParams
+        assert source.firstFrameFacts.workingSpace == frame.workingSpace
+        assert source.firstFrameFacts.linearizeParams.bayerPattern is None
+
+    @ddt.data(
         # A single image is a one-frame sequence.
         {"choice": PNG8_SEQUENCE[0], "expected_openers": [ImageSequenceSource]},
         # Several images are a sequence.
         {"choice": PNG8_SEQUENCE, "expected_openers": [ImageSequenceSource]},
-        # Raw camera files are only camera RAW.
+        # Raw camera files are opened by their own source, though OpenCV reads some as TIFF.
         {"choice": DNG16_RGGB_SEQUENCE, "expected_openers": [CameraRawSource]},
+        # FITS files are opened by their own source.
+        {"choice": FITS16_RGGB_SEQUENCE, "expected_openers": [FitsSource]},
         # A single video is a video.
         {"choice": DROPPED_FRAMES_AVI, "expected_openers": [VideoSource]},
         # A video in a list isn't opened, since only images can be chosen as a list.
@@ -366,29 +406,13 @@ class TestOpen(unittest.TestCase):
     @ddt.unpack
     def test_canOpen(self, choice: str | list[str], expected_openers: list[type[FrameSource]]) -> None:
         """Each kind of source opens the choices it recognizes by their contents."""
-        openers = [source for source in (CameraRawSource, ImageSequenceSource, VideoSource) if source.canOpen(choice)]
+        kinds = (CameraRawSource, FitsSource, ImageSequenceSource, VideoSource)
+        openers = [source for source in kinds if source.canOpen(choice)]
 
         assert openers == expected_openers
 
 
-@ddt.ddt
-class TestStaticMethods(unittest.TestCase):
-    """The static methods of the frame sources."""
-
-    @ddt.data(
-        {"dtype": np.uint8},
-        {"dtype": np.uint16},
-    )
-    @ddt.unpack
-    def test_convertDepth_float32_is_0_1_scale(self, dtype: type) -> None:
-        """A frame converts to float32 on a 0-1 scale, using the full range of its bit depth."""
-        maxVal = np.iinfo(dtype).max
-        image = np.array([[0, maxVal//3, maxVal]], dtype=dtype)
-
-        converted = FrameSource.convertDepth(image=image, toDtype=np.float32)
-
-        assert converted.dtype == np.float32
-        assert np.array_equal(np.around(converted*maxVal).astype(dtype), image)
+AVI8_GRAY = str(INPUTS_DIR/"color"/"avi8_gray.avi")
 
 
 @ddt.ddt
@@ -410,6 +434,18 @@ class TestDemosaicChoices(unittest.TestCase):
          "chosenPattern": MosaicPattern.GBRG,
          "chosenAlgorithm": DemosaicAlgorithm.VNG,
          "expectedResolvedParams": DemosaicParams(MosaicPattern.GBRG, DemosaicAlgorithm.VNG)},
+        # A FITS file states its pattern, so the pixel guess isn't used.
+        {"path": FITS16_RGGB_SEQUENCE,
+         "chosenMode": AUTO,
+         "expectedResolvedParams": DemosaicParams(MosaicPattern.RGGB, DemosaicAlgorithm.EDGE_AWARE)},
+        # A gray image that isn't a mosaic isn't demosaiced under Auto.
+        {"path": AVI8_GRAY,
+         "chosenMode": AUTO,
+         "expectedResolvedParams": None},
+        # On demosaics a gray image as the first member of the first family.
+        {"path": AVI8_GRAY,
+         "chosenMode": DemosaicMode.ON,
+         "expectedResolvedParams": DemosaicParams(MosaicPattern.RGGB, DemosaicAlgorithm.EDGE_AWARE)},
         # A color input isn't demosaiced.
         {"path": PNG8_SEQUENCE,
          "chosenMode": AUTO,
@@ -459,27 +495,6 @@ class TestDemosaicChoices(unittest.TestCase):
         source.setDemosaicChoices(mode=chosenMode, pattern=AUTO, algorithm=AUTO)
 
         assert source.demosaicParamsDisplayNames() == expectedDisplayNames
-
-    @ddt.data(
-        # Auto doesn't demosaic it.
-        {"chosenMode": AUTO,
-         "expectedResolvedParams": None},
-        # On demosaics it as the first member of the first family.
-        {"chosenMode": DemosaicMode.ON,
-         "expectedResolvedParams": DemosaicParams(MosaicPattern.RGGB, DemosaicAlgorithm.EDGE_AWARE)},
-    )
-    @ddt.unpack
-    def test_setDemosaicChoices_gray_image(
-        self,
-        chosenMode: DemosaicMode | AUTO,
-        expectedResolvedParams: DemosaicParams | None,
-    ) -> None:
-        """A gray image that isn't a mosaic is only demosaiced when asked to."""
-        path = os.path.join(self.enterContext(tempfile.TemporaryDirectory()), "gray.png")
-        cv2.imwrite(path, cv2.imread(PNG8_SEQUENCE[0], cv2.IMREAD_GRAYSCALE))
-        source = FrameSource.open(path)
-
-        assert source.setDemosaicChoices(mode=chosenMode, pattern=AUTO, algorithm=AUTO) == expectedResolvedParams
 
     @ddt.data(
         # The remembered pattern is used when it is in the guessed family.
@@ -546,18 +561,302 @@ class TestDemosaicChoices(unittest.TestCase):
 
         assert CameraRawSource.readMosaicPattern(raw) == expectedPattern
 
-    @mock.patch("rawpy.imread")
-    def test_raw_demosaic_algorithm(self, imread: mock.MagicMock) -> None:
-        """LibRaw picks the algorithm unless one is chosen."""
-        import rawpy
-        raw = imread.return_value.__enter__.return_value
-        raw.postprocess.return_value = np.zeros((2, 2, 3), dtype=np.uint16)
 
-        CameraRawSource.decodeRaw(file="camera.nef")
-        CameraRawSource.decodeRaw(file="camera.nef", algorithm=DemosaicAlgorithm.AAHD)
+def chrm(white: tuple, primaries: tuple) -> bytes:
+    """Returns a PNG cHRM chunk's data.
 
-        assert "demosaic_algorithm" not in raw.postprocess.call_args_list[0].kwargs
-        assert raw.postprocess.call_args_list[1].kwargs["demosaic_algorithm"] == rawpy.DemosaicAlgorithm.AAHD
+    Args:
+        white: CIE xy of the white point.
+        primaries: CIE xy of the red, green and blue primaries.
+
+    Returns:
+        The chunk data.
+    """
+    values = list(white) + [v for xy in primaries for v in xy]
+    return struct.pack(">8I", *[int(round(v*100000)) for v in values])
+
+
+SRGB_CHRM = chrm(white=(0.3127, 0.3290), primaries=((0.64, 0.33), (0.30, 0.60), (0.15, 0.06)))
+
+
+@pytest.mark.parametrize("chunks, expectedTransfer, expectedSpace",
+                         [([(b"cICP", bytes([1, 13, 0, 1])), (b"sRGB", b"\0")],
+                           ColorSpace.SRGB_CURVE, ColorSpace.SRGB),
+                          ([(b"cICP", bytes([9, 16, 0, 1])), (b"sRGB", b"\0")], ("H273", 16),
+                           ColorSpace.cicpPrimaries(9)),
+                          ([(b"sRGB", b"\0"), (b"gAMA", struct.pack(">I", 100000))], ColorSpace.SRGB_CURVE,
+                           ColorSpace.SRGB),
+                          ([(b"gAMA", struct.pack(">I", 45455))], ColorSpace.SRGB_CURVE, ColorSpace.SRGB),
+                          ([(b"gAMA", struct.pack(">I", 45455)), (b"cHRM", SRGB_CHRM)], ColorSpace.SRGB_CURVE,
+                           ColorSpace.SRGB),
+                          ([(b"gAMA", struct.pack(">I", 50000))], ("Gamma", 2.0), ColorSpace.UNTAGGED),
+                          ([(b"gAMA", struct.pack(">I", 100000))], None, ColorSpace.UNTAGGED),
+                          ([(b"gAMA", struct.pack(">I", 100000)), (b"cHRM", SRGB_CHRM)], None, ColorSpace.SRGB),
+                          ([(b"cHRM", SRGB_CHRM)], ColorSpace.SRGB_CURVE, ColorSpace.SRGB)],
+                         ids=["cICP over sRGB", "cICP PQ", "sRGB over gAMA", "gAMA 45455",
+                              "gAMA 45455 with sRGB cHRM", "gAMA 50000", "gAMA 100000", "gAMA 100000 with sRGB cHRM",
+                              "cHRM without gAMA"])
+def test_png_chunk_precedence(chunks: list,
+                              expectedTransfer: tuple | None,
+                              expectedSpace: ColorSpace.WorkingSpace) -> None:
+    """PNG chunks follow cICP > sRGB > cHRM/gAMA."""
+    transfer, workingSpace = ImageSequenceSource.fromPNGChunks(chunks=chunks)
+    assert transfer == expectedTransfer
+    assert workingSpace == expectedSpace
+
+
+def test_png_untagged() -> None:
+    """A PNG without color chunks is untagged."""
+    assert ImageSequenceSource.fromPNGChunks(chunks=[(b"IHDR", bytes(13)), (b"tEXt", b"a\0b")]) is None
+
+
+@pytest.mark.parametrize("colorRange, isYUV, fullRangeFormat, expected",
+                         [(None, True, False, True),
+                          (0, True, False, True),
+                          (2, True, False, False),
+                          (1, False, False, True),
+                          (None, True, True, False),
+                          (None, False, False, False)],
+                         ids=["untagged YUV", "unspecified YUV", "tagged full", "tagged limited RGB", "yuvj",
+                              "untagged RGB"])
+def test_isLimitedRange(colorRange: int | None, isYUV: bool, fullRangeFormat: bool, expected: bool) -> None:
+    """Each missing range tag falls back on its own: limited for YUV, full for RGB and gray."""
+    assert VideoSource.isLimitedRange(colorRange=colorRange, isYUV=isYUV, fullRangeFormat=fullRangeFormat) == expected
+
+
+def test_pngChunks_stop_at_idat() -> None:
+    """Only the chunks before the first IDAT are read, and a file that isn't a PNG has none."""
+    chunks = ImageSequenceSource.pngChunks(str(INPUTS_DIR/"color"/"png16_srgb_linear.png"))
+    assert chunks[0][0] == b"IHDR"
+    assert b"IDAT" not in [chunkType for chunkType, data in chunks]
+    assert ImageSequenceSource.pngChunks(str(INPUTS_DIR/"color"/"jpg_none_none.jpg")) == []
+
+
+@mock.patch("rawpy.imread")
+def test_raw_postprocess_arguments(imread: mock.MagicMock) -> None:
+    """RAW files are decoded in camera RGB with their as-shot white balance, and their black level still in."""
+    raw = imread.return_value.__enter__.return_value
+    raw.postprocess.return_value = np.full((2, 2, 3), 100, dtype=np.uint16)
+    raw.color_matrix = np.zeros((3, 4))
+    raw.rgb_xyz_matrix = np.vstack([np.eye(3), np.zeros(3)])
+    raw.black_level_per_channel = [64, 64, 64, 64]
+    raw.white_level = 1023
+    raw.num_colors = 3
+    raw.camera_whitebalance = [2.0, 1.0, 1.6, 0.0]
+    raw.daylight_whitebalance = [2.2, 1.1, 1.5, 0.0]
+
+    image, linearizeParams, workingSpace = CameraRawSource.decodeRaw(file="camera.nef")
+    CameraRawSource.decodeRaw(file="camera.nef", algorithm=DemosaicAlgorithm.AAHD)
+
+    import rawpy
+    assert raw.postprocess.call_count == 2
+    # LibRaw picks the algorithm unless one is chosen
+    assert "demosaic_algorithm" not in raw.postprocess.call_args_list[0].kwargs
+    assert raw.postprocess.call_args_list[1].kwargs["demosaic_algorithm"] == rawpy.DemosaicAlgorithm.AAHD
+    raw.postprocess.assert_any_call(
+        user_black=0,
+        user_cblack=[0, 0, 0, 0],
+        user_wb=[2.0, 1.0, 1.6, 1.0],
+        adjust_maximum_thr=0,
+        output_color=rawpy.ColorSpace.raw,
+        gamma=(1, 1),
+        no_auto_bright=True,
+        output_bps=16,
+    )
+    assert linearizeParams == LinearizeParams(
+        blackLevel=(64.0, 64.0, 64.0),
+        whiteLevel=1023.0,
+        asShotMultipliers=pytest.approx((2.0*64.0, 64.0, 1.6*64.0), rel=1e-3),
+        daylightMultipliers=pytest.approx((2.0, 1.0, 1.5/1.1)),
+    )
+    assert image.dtype == np.uint16
+
+
+# Measured with rawpy 0.25.1 (LibRaw 0.21.4)
+PIXEL_8A_COLOR_MATRIX = np.array([[1.6143, -0.5798, -0.0345, 0.0],
+                                  [-0.1447, 1.3474, -0.2027, 0.0],
+                                  [0.0291, -0.8361, 1.8070, 0.0]])
+A7III_RGB_XYZ_MATRIX = np.array([[0.7374, -0.2389, -0.0551],
+                                 [-0.5435, 1.3162, 0.2519],
+                                 [-0.1006, 0.1795, 0.6552],
+                                 [0.0, 0.0, 0.0]])
+A7III_RGB_CAM = np.array([[1.6354, -0.4220, -0.2134],
+                          [-0.1311, 1.5427, -0.4116],
+                          [0.0114, -0.4196, 1.4082]])
+
+
+def fakeRaw(**overrides: object) -> SimpleNamespace:
+    """Returns a stand-in for rawpy.RawPy with a Sony A7 III's color data.
+
+    Args:
+        **overrides: Attributes to replace.
+
+    Returns:
+        The fake RawPy.
+    """
+    raw = SimpleNamespace(color_matrix=np.zeros((3, 4)),
+                          rgb_xyz_matrix=A7III_RGB_XYZ_MATRIX,
+                          black_level_per_channel=[512, 510, 514, 512],
+                          white_level=16383,
+                          num_colors=3,
+                          camera_whitebalance=[2.21, 1.0, 1.81, 0.0],
+                          daylight_whitebalance=[2.3, 1.0, 1.7, 0.0])
+    for name, value in overrides.items():
+        setattr(raw, name, value)
+    return raw
+
+
+
+@pytest.mark.parametrize("header, dtype, expectedWhite",
+                         [({"DATAMAX": 60000}, np.uint16, 60000.0),
+                          ({"SATURATE": 4095}, np.uint16, 4095.0),
+                          ({"DATAMAX": 50000, "SATURATE": 60000}, np.uint16, 50000.0),
+                          ({}, np.uint16, 65535.0),
+                          ({}, np.uint8, 255.0),
+                          ({}, np.int32, 2147483647.0)])
+def test_fits_levels(header: dict, dtype: type, expectedWhite: float) -> None:
+    """FITS white comes from DATAMAX or SATURATE when present, else the integer type's maximum; no black is stated."""
+    linearizeParams = FitsSource.fromFITS(header=header, data=np.zeros((4, 4), dtype=dtype))
+    assert linearizeParams.blackLevel is None
+    assert linearizeParams.whiteLevel == expectedWhite
+    assert linearizeParams.bayerPattern is None
+
+
+def test_fits_float_levels() -> None:
+    """Float FITS without levels keywords: white 1.0 if the data fits in 0-1, else 65535."""
+    assert FitsSource.fromFITS(header={}, data=np.array([[0.0, 0.5, 1.0]])).whiteLevel == 1.0
+    assert FitsSource.fromFITS(header={}, data=np.array([[0.0, 2.0, 4000.0]])).whiteLevel == 65535.0
+
+
+def test_fits_levels_dont_depend_on_brightness() -> None:
+    """Two frames of different brightness get the same scale (no per-frame min/max)."""
+    header = {"SATURATE": 60000}
+    bright = np.array([[2000, 50000]], dtype=np.uint16)
+    dim = np.array([[2000, 30000]], dtype=np.uint16)
+    brightParams = FitsSource.fromFITS(header=header, data=bright)
+    dimParams = FitsSource.fromFITS(header=header, data=dim)
+    assert brightParams == dimParams
+    assert linearize(img=dim, linearizeParams=dimParams)[0, 1] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("header, height, expected",
+                         [({"BAYERPAT": "RGGB"}, 4, "RGGB"),
+                          ({"BAYERPAT": "rggb "}, 4, "RGGB"),
+                          ({"BAYERPAT": "RGGB", "YBAYROFF": 1}, 4, "GBRG"),
+                          ({"BAYERPAT": "RGGB", "XBAYROFF": 1}, 4, "GRBG"),
+                          ({"BAYERPAT": "RGGB", "XBAYROFF": 1, "YBAYROFF": 1}, 4, "BGGR"),
+                          ({"BAYERPAT": "GRBG", "YBAYROFF": 2}, 4, "GRBG"),
+                          ({"BAYERPAT": "RGGB", "ROWORDER": "BOTTOM-UP"}, 4, "GBRG"),
+                          ({"BAYERPAT": "RGGB", "ROWORDER": "BOTTOM-UP"}, 5, "RGGB"),
+                          ({"BAYERPAT": "RGGB", "ROWORDER": "TOP-DOWN"}, 4, "RGGB"),
+                          ({"BAYERPAT": "CMYG"}, 4, None)])
+def test_fits_bayer_pattern(header: dict, height: int, expected: str | None) -> None:
+    """BAYERPAT is normalized to the stored data's first pixel with its offsets and row order."""
+    linearizeParams = FitsSource.fromFITS(header=header, data=np.zeros((height, 4), dtype=np.uint16))
+    assert linearizeParams.bayerPattern == (None if expected is None else MosaicPattern(expected))
+
+
+def test_fromRAW_levels() -> None:
+    """RAW levels come from black_level_per_channel (greens averaged) and white_level."""
+    linearizeParams, workingSpace = CameraRawSource.fromRAW(fakeRaw())
+    assert linearizeParams.blackLevel == (512.0, 511.0, 514.0)
+    assert linearizeParams.whiteLevel == 16383.0
+
+
+def test_fromRAW_rgb_xyz_matrix() -> None:
+    """A per-model table matrix (A7 III) gives the expected rgbCam."""
+    linearizeParams, workingSpace = CameraRawSource.fromRAW(fakeRaw())
+    rgbCam = np.linalg.solve(ColorSpace.SRGB.toXYZ, workingSpace.toXYZ)
+    assert np.allclose(rgbCam, A7III_RGB_CAM, atol=5e-4)
+    assert np.allclose(rgbCam.sum(axis=1), 1)
+    assert np.allclose(workingSpace.toXYZ @ np.ones(3), ColorSpace.D65_XYZ, atol=1e-6)
+
+
+def test_fromRAW_color_matrix() -> None:
+    """A DNG's color_matrix (Pixel 8a) is used as rgbCam."""
+    raw = fakeRaw(rgb_xyz_matrix=np.zeros((4, 3)), color_matrix=PIXEL_8A_COLOR_MATRIX)
+    linearizeParams, workingSpace = CameraRawSource.fromRAW(raw)
+    assert np.allclose(workingSpace.toXYZ, ColorSpace.SRGB.toXYZ @ PIXEL_8A_COLOR_MATRIX[:, :3])
+    assert np.allclose(workingSpace.toXYZ @ np.ones(3), ColorSpace.D65_XYZ, atol=1e-6)
+
+
+def test_fromRAW_without_matrix() -> None:
+    """A camera LibRaw doesn't know gets no primaries and a warning."""
+    with pytest.warns(ColorSpace.ColorWarning):
+        linearizeParams, workingSpace = CameraRawSource.fromRAW(fakeRaw(rgb_xyz_matrix=np.zeros((4, 3))))
+    assert workingSpace.toXYZ is None
+    assert linearizeParams.whiteLevel == 16383.0
+    assert linearizeParams.asShotMultipliers is not None
+    assert linearizeParams.daylightMultipliers is None
+
+
+@pytest.mark.parametrize("asShot, expected",
+                         [([2.0, 1.0, 1.6, 0.0], [2.0, 1.0, 1.6, 1.0]),
+                          ([512.0, 256.0, 400.0, 258.0], [2.0, 1.0, 1.5625, 258/256]),
+                          ([0.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0])])
+def test_asShotMultipliers(asShot: list[float], expected: list[float]) -> None:
+    """As-shot multipliers are normalized to green, G2 = G when absent, and all 1 when the file states none."""
+    assert CameraRawSource.asShotMultipliers(fakeRaw(camera_whitebalance=asShot)) == pytest.approx(expected)
+
+
+def test_fromRAW_daylight_multipliers() -> None:
+    """The D65 reference multipliers are LibRaw's daylight multipliers normalized to green."""
+    linearizeParams, workingSpace = CameraRawSource.fromRAW(fakeRaw(daylight_whitebalance=[512.0, 256.0, 384.0, 0.0]))
+    assert linearizeParams.daylightMultipliers == pytest.approx((2.0, 1.0, 1.5))
+
+
+def test_raw_daylight_white_is_d65() -> None:
+    """A DNG's sensor response to D65 white, once balanced by its daylight multipliers, is D65 in its working space."""
+    import rawpy
+    with rawpy.imread(str(INPUTS_DIR/"raw"/"pixel_crop_1.dng")) as raw:
+        linearizeParams, workingSpace = CameraRawSource.fromRAW(raw)
+    daylight = np.array(linearizeParams.daylightMultipliers)
+    black = np.array(linearizeParams.blackLevel)
+    # Raw values of a D65 white as LibRaw stores them: black plus a response inversely proportional to daylight
+    sensor = black + 0.5*(linearizeParams.whiteLevel - black)/daylight
+    stored = (sensor*np.array(linearizeParams.asShotMultipliers)).reshape(1, 1, 3)[:, :, ::-1]
+    linear = linearize(img=stored.astype(np.float32), linearizeParams=linearizeParams)[0, 0, ::-1]
+    assert linear == pytest.approx(np.full(3, 0.5), rel=1e-5)
+    assert workingSpace.toXYZ @ linear == pytest.approx(0.5*np.array(ColorSpace.D65_XYZ), rel=1e-4)
+
+
+def test_linearize_sensor_data_maps_black_to_0_and_white_to_1() -> None:
+    """Sensor data maps black to 0 and white to 1 per channel (levels stated RGB, image BGR), unclipped."""
+    img = np.array([[[1016, 1000, 16383], [1000, 1000, 1000]]], dtype=np.uint16)
+    linearizeParams = LinearizeParams(blackLevel=(1000.0, 1008.0, 1016.0), whiteLevel=16383.0)
+    linear = linearize(img=img, linearizeParams=linearizeParams)
+    assert linear.dtype == np.float32
+    assert linear[0, 0] == pytest.approx([0, -8/15375, 1])
+    assert linear[0, 1, 0] < 0
+    assert linear[0, 1, 2] == 0
+
+
+def sensorLinearizeParams(**fields: object) -> LinearizeParams:
+    """Returns linearize params for sensor data with black 0 and white 1000, with the given fields."""
+    return LinearizeParams(blackLevel=(0.0, 0.0, 0.0), whiteLevel=1000.0, **fields)
+
+
+def test_linearize_swaps_as_shot_for_daylight() -> None:
+    """Data balanced as shot (each channel multiplied by 2, 1, 4 and a common 3) ends balanced to the D65 reference."""
+    # A gray card as shot is (2, 1, 4) of the sensor's white; the reference sees it as (1.5, 1, 2)
+    raw = np.array([[[100, 100, 100]]], dtype=np.float32)
+    stored = raw*np.array([4, 1, 2], dtype=np.float32)*3
+    linearizeParams = sensorLinearizeParams(asShotMultipliers=(6.0, 3.0, 12.0), daylightMultipliers=(1.5, 1.0, 2.0))
+    assert linearize(img=stored, linearizeParams=linearizeParams)[0, 0] == pytest.approx([0.2, 0.1, 0.15])
+
+
+def test_linearize_keeps_as_shot_without_daylight() -> None:
+    """Without reference multipliers (no camera matrix) the data stays balanced as shot."""
+    raw = np.array([[[100, 100, 100]]], dtype=np.float32)
+    stored = raw*np.array([4, 1, 2], dtype=np.float32)*3
+    linearizeParams = sensorLinearizeParams(asShotMultipliers=(6.0, 3.0, 12.0))
+    assert linearize(img=stored, linearizeParams=linearizeParams)[0, 0] == pytest.approx([0.4, 0.1, 0.2])
+
+
+def test_linearize_multiplies_nothing_without_multipliers() -> None:
+    """Sensor data with no multipliers (generic Bayer, FITS) is only scaled by its levels."""
+    img = np.array([[[100, 100, 100]]], dtype=np.float32)
+    assert linearize(img=img, linearizeParams=sensorLinearizeParams())[0, 0] == pytest.approx([0.1, 0.1, 0.1])
 
 
 class TestCameraRawPreview(unittest.TestCase):

@@ -26,7 +26,7 @@ from Constants import (
 )
 from Align import Align, centerOfMass, dilateImg, normalizeImg
 from Stack import Stack, transform
-from Process import Process
+from Process import Process, blackLevelFromPosition, positionFromBlackLevel
 from Globals import *
 from WorkerPools import FRAME_POOL
 from deconvolution import *
@@ -61,6 +61,8 @@ class UI:
         self.stack = None
         self.process = None
         self.mousePosition = None
+        # Whether the black level slider is being moved for a new image, which is processed anyway
+        self.settingBlackLevel = False
         self.clickedDriftP1 = False
         self.clickedDriftP2 = False
         self.clickedAreaOfInterest = False
@@ -149,6 +151,10 @@ class UI:
         self.builder.get_object("deringSize").add_mark(0, Gtk.PositionType.TOP, None)
         self.builder.get_object("deringBlend").add_mark(1, Gtk.PositionType.TOP, None)
         self.builder.get_object("blackLevel").add_mark(0, Gtk.PositionType.TOP, None)
+        self.builder.get_object("blackLevel").connect(
+            "format-value",
+            lambda scale, position: f"{100*blackLevelFromPosition(position/100):.1f}",
+        )
         self.builder.get_object("gamma").add_mark(100, Gtk.PositionType.TOP, None)
         self.builder.get_object("value").add_mark(100, Gtk.PositionType.TOP, None)
         self.builder.get_object("red").add_mark(100, Gtk.PositionType.TOP, None)
@@ -324,7 +330,7 @@ class UI:
         thread.start()
         
     # Sets the number of threads to use
-    def setThreads(self, *args):
+    def setThreads(self, *args: object) -> None:
         g.nThreads = int(self.cpus.get_value())
         self.preferences.set("cpus", g.nThreads)
         # The next job creates a pool of the new size
@@ -383,6 +389,29 @@ class UI:
         Z = GLib.Bytes.new(z)
         height, width = img.shape[:2]
         return GdkPixbuf.Pixbuf.new_from_bytes(Z, GdkPixbuf.Colorspace.RGB, False, 8, width, height, width*3)
+
+    def createDisplayPixbuf(self, img: np.ndarray) -> GdkPixbuf.Pixbuf:
+        """Returns a new GdkPixbuf showing linear working data as display-referred sRGB.
+
+        Args:
+            img: Linear 0-1 RGB image.
+
+        Returns:
+            The pixbuf.
+        """
+        return self.createPixbuf(self.video.displayImage(img))
+
+    @staticmethod
+    def toUint8(img: np.ndarray) -> np.ndarray:
+        """Quantizes a 0-1 image to uint8, for previews that aren't color.
+
+        Args:
+            img: The image.
+
+        Returns:
+            The uint8 image.
+        """
+        return np.around(np.clip(a=img, a_min=0, a_max=1)*255).astype(np.uint8)
     
     def updatePreview(self, dialog: Gtk.FileChooser) -> None:
         """Shows a thumbnail of the file selected in the file chooser, or hides the preview.
@@ -394,11 +423,11 @@ class UI:
         pixbuf = None
         if(path != None and os.path.isfile(path)):
             try:
-                source = FrameSource.open(path)
+                video = Video.open(path)
                 try:
-                    img = source.thumbnail()
+                    img = video.source.thumbnail()
                 finally:
-                    source.close()
+                    video.source.close()
                 pixbuf = self.createPixbuf(img)
             except Exception:
                 pass
@@ -443,7 +472,7 @@ class UI:
             paths: The chosen files.
         """
         try:
-            source = FrameSource.open(paths[0] if len(paths) == 1 else paths)
+            video = Video.open(paths[0] if len(paths) == 1 else paths)
         except ValueError as error:
             message = str(error)
             def showError() -> None:
@@ -452,30 +481,30 @@ class UI:
                 self.enableUI()
             GLib.idle_add(showError)
             return
-        frameCount = source.frameCount()
+        frameCount = video.source.frameCount()
         # pre-cache the supportedDemosaicModes.
         try:
-            source.supportedDemosaicModes()
+            video.source.supportedDemosaicModes()
         except Exception:
             # Tolerate a corrupt first frame that supportedDemosaicModes() may try to read.
             pass
         def load() -> None:
             """Loads the source: one frame goes straight to Process, more go through Align and Stack."""
             if(frameCount == 1):
-                self.loadSingleFrame(source)
+                self.loadSingleFrame(video)
             else:
-                self.loadFrames(source)
+                self.loadFrames(video)
         GLib.idle_add(load)
 
-    def loadFrames(self, source: FrameSource) -> None:
-        """Starts loading a source of several frames to align and stack. finishedVideo is called when it's done.
+    def loadFrames(self, video: Video) -> None:
+        """Starts loading a video of several frames to align and stack. finishedVideo is called when it's done.
 
         Args:
-            source: The source.
+            video: The video.
         """
         try:
-            g.source = source
-            self.video = Video(source)
+            g.source = video.source
+            self.video = video
             self.updateDemosaicChoices()
             self.video.checkMemory()
             thread = Thread(target=self.video.run, args=())
@@ -483,15 +512,15 @@ class UI:
         except MemoryError:
             self.enableUI()
 
-    def loadSingleFrame(self, source: FrameSource) -> None:
-        """Loads a source of one frame straight into the Process tab.
+    def loadSingleFrame(self, video: Video) -> None:
+        """Loads a video of one frame straight into the Process tab.
 
         Args:
-            source: The source.
+            video: The video.
         """
-        g.source = source
+        g.source = video.source
         try:
-            self.video = Video(source)
+            self.video = video
             self.updateDemosaicChoices()
             self.video.checkMemory()
 
@@ -500,19 +529,14 @@ class UI:
 
             self.stack = None
             self.process = Process(self.video.getFrame(index=0))
+            self.applyAutoBlackLevel()
             self.builder.get_object("alignTab").set_sensitive(False)
             self.builder.get_object("stackTab").set_sensitive(False)
             self.builder.get_object("processTab").set_sensitive(True)
             self.tabs.set_current_page(UI.PROCESS_TAB)
 
-            img = cv2.cvtColor(
-                self.video.getFrame(
-                    index=0,
-                    toDtype=np.uint8,
-                ),
-                cv2.COLOR_BGR2RGB,
-            )
-            pixbuf = self.createPixbuf(img)
+            img = cv2.cvtColor(self.video.getFrame(index=0), cv2.COLOR_BGR2RGB)
+            pixbuf = self.createDisplayPixbuf(img)
             self.frame.set_from_pixbuf(pixbuf.copy())
         except MemoryError:
             pass
@@ -547,28 +571,30 @@ class UI:
             response = self.saveDialog.run()
             if(response == Gtk.ResponseType.OK):
                 fileName = self.saveDialog.get_filename()
+                bits = 16 if self.bitDepth.get_active_id() == "1" else 8
+                if(not fileName.lower().endswith(Video.SAVE_EXTENSIONS)):
+                    self.saveDialog.hide()
+                    self.showErrorDialog("Only .png, .jpg/.jpeg and .tif/.tiff files are supported")
+                    start()
+                    return
+                if(bits == 16 and fileName.lower().endswith((".jpg", ".jpeg"))):
+                    self.saveDialog.hide()
+                    self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
+                    start()
+                    return
                 try:
                     while(self.processThread != None and self.processThread.is_alive()):
                         time.sleep(0.1) # Make sure the file isn't still being processed
-                    bitDepth = self.bitDepth.get_active_text()
-                    if(bitDepth == "8-bit"):
-                        cv2.imwrite(fileName, cv2.cvtColor(np.around(self.process.finalImage*255).astype('uint8'), cv2.COLOR_RGB2BGR))
-                    elif(bitDepth == "16-bit"):
-                        if(fileName.endswith(".png") or fileName.endswith(".tif") or fileName.endswith(".tiff")):
-                            cv2.imwrite(fileName, cv2.cvtColor(np.around(self.process.finalImage*65535).astype('uint16'), cv2.COLOR_RGB2BGR))
-                        else:
-                            self.showErrorDialog("Only .png and .tif are supported for 16-bit images")
-                            start()
-                except: # Save Failed
-                    self.showErrorDialog("There was an error saving the image, make sure it is a valid file extension.")
+                    self.video.save(path=fileName, img=self.process.finalImage, bits=bits)
+                except Exception as error: # Save Failed
+                    print(error)
+                    self.showErrorDialog("There was an error saving the image.")
         start()
         self.saveDialog.hide()
         
     def finishedVideo(self) -> None:
         """Handler for when the frames finish loading; prepares and moves on to the Align tab."""
         def update():
-            self.tabs.next_page()
-           
             self.frameScale.set_sensitive(True)
            
             self.startFrame.set_lower(0)
@@ -596,6 +622,9 @@ class UI:
                     "Not all images were added to the stack.  "
                     "Make sure they are all the same dimensions."
                 )
+            if(self.video.descriptionMismatch):
+                self.showErrorDialog("Not all images have the same color tags.  "
+                                     "Every image is decoded like the first one.")
             self.window.set_title(self.sourceTitle() + " - " + UI.TITLE)
             self.saveDialog.set_current_name("")
 
@@ -603,6 +632,7 @@ class UI:
             self.builder.get_object("stackTab").set_sensitive(False)
             self.builder.get_object("processTab").set_sensitive(False)
             self.stack = None
+            self.tabs.next_page()
         GLib.idle_add(update)
         
     def openPSF(self, *args: object) -> None:
@@ -823,6 +853,8 @@ class UI:
                 # Video/Sequence
                 videoIndex = min(videoIndex, len(self.video.frames)-1)
                 img = cv2.cvtColor(self.video.getFrame(self.video.frames[videoIndex]), cv2.COLOR_BGR2RGB)
+            # Previews are shown in display values
+            img = self.video.displayEncode(img)
                 
             height, width = img.shape[:2]
             
@@ -855,7 +887,7 @@ class UI:
                     C[1][2] = -C[1][2]
                 img = cv2.warpAffine(img, C, (width, height), flags=cv2.INTER_NEAREST)
 
-            pixbuf = self.createPixbuf((img*255).astype(np.uint8))
+            pixbuf = self.createPixbuf(UI.toUint8(img))
             self.frame.set_from_pixbuf(pixbuf.copy())
         elif(page_num == UI.STACK_TAB and self.stack is not None):
             if(int(self.frameSlider.get_value()) >= len(self.stack.tmats)):
@@ -863,18 +895,15 @@ class UI:
             tmat = self.stack.tmats[int(self.frameSlider.get_value())]
             videoIndex = tmat[0]
             M = tmat[1]
-            img = self.video.getFrame(
-                index=videoIndex,
-                toDtype=np.uint8,
-            )
+            img = self.video.getFrame(videoIndex)
             if(g.autoCrop):
-                ref = (self.stack.refBG*255).astype(np.uint8)
+                ref = self.stack.refBG
             else:
                 ref = None
             img = transform(img, ref, M, self.align.minX, self.align.maxX, self.align.minY, self.align.maxY, g)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            pixbuf = self.createPixbuf(img)
+            pixbuf = self.createDisplayPixbuf(img)
             self.frame.set_from_pixbuf(pixbuf.copy())
             self.updateQualityImage()
             
@@ -1064,7 +1093,7 @@ class UI:
         self.psfImage.set_from_pixbuf(pixbuf.copy())
     
     # Updates the RGB histogram of the final image    
-    def updateHistogram(self):
+    def updateHistogram(self) -> None:
         allocation = self.builder.get_object("processTab").get_allocation()
         width = max(250, allocation.width-1)
         padding = 5
@@ -1072,8 +1101,9 @@ class UI:
         bins = np.arange(256).reshape(256, 1)
         
         color = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+        displayed = self.video.displayImage(self.process.finalImage)
         for i, col in enumerate(color):
-            hist = np.log(cv2.calcHist([np.around(self.process.finalImage*255).astype('uint8')],[i],None,[256],[0,256]) + 1)
+            hist = np.log(cv2.calcHist([displayed],[i],None,[256],[0,256]) + 1)
             cv2.normalize(hist, hist, 0, 99, cv2.NORM_MINMAX)
             hist = 99 - hist
             hist = np.int32(np.around(hist))
@@ -1377,6 +1407,7 @@ class UI:
     def finishedStack(self):
         def update():
             self.process = Process(self.stack.stackedImage)
+            self.applyAutoBlackLevel()
             self.tabs.next_page()
             self.enableUI()
             self.builder.get_object("alignTab").set_sensitive(True)
@@ -1384,9 +1415,29 @@ class UI:
             self.builder.get_object("processTab").set_sensitive(True)
         GLib.idle_add(update)
         
+    def setAutoBlackLevel(self, *args: object) -> None:
+        """Locks the black level slider to the automatic black level while Auto is on, and reprocesses."""
+        auto = self.builder.get_object("autoBlackLevel").get_active()
+        self.builder.get_object("blackLevel").set_sensitive(not auto)
+        if(auto and self.process is not None):
+            self.builder.get_object("blackLevelAdjust").set_value(100*positionFromBlackLevel(self.process.autoBlackLevel))
+
+    def applyAutoBlackLevel(self) -> None:
+        """Moves the black level slider to a new image's automatic black level, if Auto is on, without reprocessing.
+
+        The new image is processed in full when the Process tab is shown, which reads the slider.
+        """
+        if(not self.builder.get_object("autoBlackLevel").get_active()):
+            return
+        self.settingBlackLevel = True
+        try:
+            self.builder.get_object("blackLevelAdjust").set_value(100*positionFromBlackLevel(self.process.autoBlackLevel))
+        finally:
+            self.settingBlackLevel = False
+
     # Processes the final Stacked image
     def processImage(self, *args: object) -> None:
-        if(g.source is None):
+        if(g.source is None or self.settingBlackLevel):
             return
         self.processSpinner.start()
         self.processSpinner.show()
@@ -1422,7 +1473,7 @@ class UI:
         g.deringBlend = int(self.builder.get_object("deringBlendAdjust").get_value())
         
         g.gamma = self.builder.get_object("gammaAdjust").get_value()
-        g.blackLevel = self.builder.get_object("blackLevelAdjust").get_value()
+        g.blackLevel = blackLevelFromPosition(self.builder.get_object("blackLevelAdjust").get_value()/100)
         g.value = self.builder.get_object("valueAdjust").get_value()
         
         g.redAdjust = self.builder.get_object("redAdjust").get_value()
@@ -1500,15 +1551,16 @@ class UI:
         self.updatePSFImage(args)
     
     # Called when processing is complete
-    def finishedProcessing(self, *args):
+    def finishedProcessing(self, *args) -> None:
         def update():
             if(self.process is None):
                 # The image was dropped while it was processed
                 return
             if(self.showMask.get_active() and self.process.thresh is not None):
-                pixbuf = self.createPixbuf(np.around(self.process.thresh*255).astype('uint8'))
+                # The mask isn't light, so it is shown as it is
+                pixbuf = self.createPixbuf(UI.toUint8(self.process.thresh))
             else:
-                pixbuf = self.createPixbuf(np.around(self.process.finalImage*255).astype('uint8'))
+                pixbuf = self.createDisplayPixbuf(self.process.finalImage)
             self.frame.set_from_pixbuf(pixbuf.copy())
             self.updateHistogram()
             self.processSpinner.stop()

@@ -11,3 +11,7 @@ pystackreg==0.2.8
 PyWavelets==1.10.0
 rawpy==0.28.0
 typing_extensions==4.16.0
+colour-science==0.4.7
+av==19.0.2
+pypng==0.20220715.0
+tifffile==2026.11.16

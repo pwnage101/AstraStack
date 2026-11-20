@@ -3,12 +3,18 @@ from lazy import lazy
 cv2 = lazy("cv2")
 np = lazy("numpy")
 rawpy = lazy("rawpy")
-import bisect
+av = lazy("av")
+pypng = lazy("png")
 import os
 from abc import ABC, abstractmethod
+import dataclasses
+import struct
+import warnings
+from dataclasses import dataclass
 from functools import cached_property
 from typing import NamedTuple, override
 from natsort import natsorted, ns
+import ColorSpace
 from Constants import (
     AUTO,
     LIBRAW_EXTENSIONS,
@@ -18,6 +24,66 @@ from Constants import (
     DemosaicParams,
     MosaicPattern,
 )
+
+@dataclass(frozen=True)
+class LinearizeParams:
+    """What a source still has to undo after reading a frame to get linear 0-1 working data. Private to this module."""
+    transfer: ColorSpace.Transfer | None = None  # ("H273", 1)
+    bayerPattern: MosaicPattern | None = None  # MosaicPattern.RGGB, as the file states it
+    # black level for each output channel (1-tuple for grayscale, 3-tuple for RGB).
+    blackLevel: tuple[float] | tuple[float, float, float] | None = None
+    whiteLevel: float | None = None  # 16383.0
+    # What the source multiplied the sensor data by before demosaicing (as-shot white balance, and LibRaw's scale
+    # to 16 bits), one per channel (RGB); (125.2, 64.1, 108.4)
+    asShotMultipliers: tuple[float, float, float] | None = None
+    # The D65 reference multipliers, normalized to green; the sensor data is rebalanced to them after demosaicing
+    daylightMultipliers: tuple[float, float, float] | None = None  # (2.17, 1.0, 1.49)
+
+class StoredFrame(NamedTuple):
+    """A frame as stored, and how to linearize it."""
+    image: np.ndarray
+    linearizeParams: LinearizeParams
+    workingSpace: ColorSpace.WorkingSpace
+
+class Frame(NamedTuple):
+    """A frame as working data."""
+    image: np.ndarray  # Linear 0-1 float32 BGR
+    mismatch: bool  # Whether the frame is described differently from the source's first, which it is linearized like
+
+def linearize(img: np.ndarray, linearizeParams: LinearizeParams) -> np.ndarray:
+    """Converts stored image values to linear 0-1 working data.
+
+    Args:
+        img: The stored (integer, or float for FITS) image, gray or with 3 channels (BGR).
+        linearizeParams: How the values are encoded.
+
+    Returns:
+        The linear float32 image. Sensor data has its black level mapped to 0 and its white level to 1 per channel,
+        unclipped: noise below black stays negative. Sensor data with multipliers stays balanced as shot, or is
+        balanced to the D65 reference when the daylight multipliers are given.
+    """
+    if(linearizeParams.whiteLevel is not None):
+        black = (
+            np.float32(0)
+            if linearizeParams.blackLevel is None
+            else np.array(linearizeParams.blackLevel[::-1], dtype=np.float32)
+        )
+        if(img.ndim == 2):
+            black = np.float32(np.mean(black))
+        img = img.astype(np.float32)
+        if(linearizeParams.asShotMultipliers is None):
+            return ((img - black)/(np.float32(linearizeParams.whiteLevel) - black)).astype(np.float32)
+        # The image is in the as-shot balance: its black and white levels carry each channel's multiplier
+        multipliers = np.array(linearizeParams.asShotMultipliers[::-1], dtype=np.float32)
+        asShot = multipliers/multipliers[1]
+        linear = (img/multipliers[1] - black*asShot)/(np.float32(linearizeParams.whiteLevel) - black)
+        if(linearizeParams.daylightMultipliers is not None):
+            daylight = np.array(linearizeParams.daylightMultipliers[::-1], dtype=np.float32)
+            linear = linear*(daylight/asShot)
+        return linear.astype(np.float32)
+    if(np.issubdtype(img.dtype, np.floating)):
+        return ColorSpace.transferToLinear(x=img.astype(np.float32), transfer=linearizeParams.transfer)
+    return ColorSpace.linearizeInteger(img=img, transfer=linearizeParams.transfer)
 
 class FrameSource(ABC):
     """A sequence of frames stored in one or more files, addressed by integer index.
@@ -31,6 +97,14 @@ class FrameSource(ABC):
 
     # The demosaic params to actually send to the demosaicing library. None to disable demosaicing.
     demosaicParams: DemosaicParams | None = None
+
+    @dataclass(frozen=True)
+    class FrameFacts:
+        """Hints about the inputs derived from one frame. Every frame is linearized like the first one, so the
+        images of a sequence that are tagged differently are all linearized alike.
+        """
+        linearizeParams: LinearizeParams
+        workingSpace: ColorSpace.WorkingSpace
 
     @classmethod
     def open(cls, path: str | list[str]) -> FrameSource:
@@ -48,7 +122,7 @@ class FrameSource(ABC):
         """
         if(len(path) == 0):
             raise ValueError("No file was chosen.")
-        for source in (CameraRawSource, ImageSequenceSource, VideoSource):
+        for source in (CameraRawSource, FitsSource, ImageSequenceSource, VideoSource):
             if(source.canOpen(path)):
                 return source(path)
         raise ValueError("The chosen files can't be opened. Choose one video, or one or more images.")
@@ -85,18 +159,6 @@ class FrameSource(ABC):
         """
 
     @abstractmethod
-    def readFrame(self, index: int) -> np.ndarray | None:
-        """Reads one frame as BGR, demosaiced as the source's demosaic params say.
-
-        Args:
-            index: The frame's index.
-
-        Returns:
-            The frame in BGR order at its stored depth (uint8 or uint16), or None if the source
-            has no readable frame at index.
-        """
-
-    @abstractmethod
     def frameSize(self) -> tuple[int, int]:
         """Returns the size of the frames.
 
@@ -106,7 +168,7 @@ class FrameSource(ABC):
 
     @abstractmethod
     def thumbnail(self) -> np.ndarray:
-        """Makes a display-ready thumbnail of the source, leaving its demosaic params as they are.
+        """Makes a display-referred thumbnail of the source, leaving its demosaic params as they are.
 
         The thumbnail is shown as sRGB as it is, so it only needs to look close to the first frame, as a camera's own
         rendering does.
@@ -115,30 +177,45 @@ class FrameSource(ABC):
             The thumbnail as uint8 RGB, possibly at a reduced size.
         """
 
-    @staticmethod
-    def convertDepth(image: np.ndarray, toDtype: type | None = None) -> np.ndarray:
-        """Converts a frame read from a source to another depth.
+    @abstractmethod
+    def readFrame(self, index: int, atRecordedDepth: bool = False) -> Frame | None:
+        """Reads one frame as linear working data, demosaiced as the source's demosaic params say.
+
+        Every frame is linearized like the first one.
 
         Args:
-            image: A frame as readFrame returns it.
-            toDtype: The output's dtype: np.float32 for a 0-1 scale, np.uint8 for 8 bits
-                (16-bit frames keep their high byte), or None to keep the input's dtype.
+            index: The frame's index.
+            atRecordedDepth: Whether to round frames the source widened back to the depth they were recorded at,
+                which the thresholds on measurements were tuned on. Ignored by sources that don't widen frames.
 
         Returns:
-            The frame at the new depth.
-
-        Raises:
-            ValueError: If the frame's dtype or toDtype isn't supported.
+            The frame, or None if the source has no readable frame at index.
         """
-        if image.dtype not in (np.uint8, np.uint16):
-            raise ValueError(f"Unsupported frame dtype: {image.dtype}")
-        if toDtype not in (None, np.float32, np.uint8):
-            raise ValueError(f"Unsupported toDtype: {toDtype}")
-        if toDtype == np.float32:
-            return image.astype(np.float32) / np.iinfo(image.dtype).max
-        if toDtype == np.uint8 and image.dtype == np.uint16:
-            return (image >> 8).astype(np.uint8)
-        return image
+
+    @property
+    @abstractmethod
+    def firstFrameFacts(self) -> FrameSource.FrameFacts:
+        """What the first frame says about the source, read from it the first time it is needed."""
+
+    def differsFromFirst(self, stored: StoredFrame) -> bool:
+        """Returns whether a stored frame is described differently from the source's first."""
+        first = self.firstFrameFacts
+        return (stored.linearizeParams, stored.workingSpace) != (first.linearizeParams, first.workingSpace)
+
+    def frameWorkingSpace(self) -> ColorSpace.WorkingSpace:
+        """Returns the working space of the frames readFrame returns, demosaiced as the source's demosaic params say."""
+        return self._workingSpaceFor(self.demosaicParams)
+
+    @abstractmethod
+    def _workingSpaceFor(self, demosaicParams: DemosaicParams | None) -> ColorSpace.WorkingSpace:
+        """Returns the working space of the frames demosaiced as some demosaic params say.
+
+        Args:
+            demosaicParams: The demosaic params.
+
+        Returns:
+            The working space.
+        """
 
     @abstractmethod
     def supportedDemosaicModes(self) -> list[DemosaicMode]:
@@ -223,7 +300,8 @@ class FrameSource(ABC):
 class OpenCVDemosaicSource(FrameSource):
     """A source whose stored frames may be a mosaic, which OpenCV demosaics.
 
-    Auto demosaics gray frames that the pixel guess finds a mosaic in, with Edge-aware.
+    Auto demosaics gray frames whose file states a pattern, or that the pixel guess finds a mosaic in, with
+    Edge-aware.
     """
 
     DEMOSAIC_LIBRARY_NAME = "OpenCV"
@@ -249,37 +327,50 @@ class OpenCVDemosaicSource(FrameSource):
     # the user last picked the other member, each family's first is used.
     MOSAIC_FAMILIES = ((MosaicPattern.RGGB, MosaicPattern.BGGR), (MosaicPattern.GRBG, MosaicPattern.GBRG))
 
-    class FrameFacts(NamedTuple):
-        """Hints about the inputs derived from one frame."""
+    @dataclass(frozen=True)
+    class FrameFacts(FrameSource.FrameFacts):
+        """Hints about the inputs derived from one frame, for OpenCV's demosaic."""
         isGray: bool  # Whether its channels are equal, so it may be a mosaic
-        is8Bit: bool  # Whether it is stored at 8 bits
-        mosaicFamily: tuple[MosaicPattern, MosaicPattern] | None  # The family guessMosaicFamily finds, if any
+        is8Bit: bool  # Whether it was recorded at 8 bits
+        # The family guessMosaicFamily finds, if the frame is gray and its file states no pattern
+        mosaicFamily: tuple[MosaicPattern, MosaicPattern] | None
 
     @abstractmethod
-    def readStored(self, index: int) -> np.ndarray | None:
-        """Reads one frame as stored.
+    def readStored(self, index: int) -> StoredFrame | None:
+        """Reads one frame as stored, with its own description.
 
         Args:
             index: The frame's index.
 
         Returns:
             The frame in BGR order, or with a single channel for gray or Bayer mosaic frames,
-            at its stored depth (uint8 or uint16); or None if the source has no readable frame
-            at index.
+            at its stored depth (uint8 or uint16, or float32 for float FITS data); or None if
+            the source has no readable frame at index.
         """
 
     @cached_property
+    @override
     def firstFrameFacts(self) -> OpenCVDemosaicSource.FrameFacts:
-        """What the first frame says about the source, read from it the first time it is needed."""
-        image = self.readStored(0)
-        if(image is None):
-            # Without a first frame to judge by, the frames are read as color, as they are when no mosaic is found
-            return OpenCVDemosaicSource.FrameFacts(isGray=False, is8Bit=False, mosaicFamily=None)
-        isGray = OpenCVDemosaicSource.isGray(image)
+        """The first frame is read as stored, which also tells whether it may be a mosaic and its recorded depth."""
+        stored = self.readStored(0)
+        if(stored is None):
+            # Without a first frame to judge by, the frames are read as untagged color, as they are when no mosaic is
+            # found
+            return OpenCVDemosaicSource.FrameFacts(
+                linearizeParams=LinearizeParams(transfer=ColorSpace.SRGB_CURVE),
+                workingSpace=ColorSpace.SRGB,
+                isGray=False,
+                is8Bit=False,
+                mosaicFamily=None,
+            )
+        isGray = OpenCVDemosaicSource.isGray(stored.image)
+        guess = isGray and stored.linearizeParams.bayerPattern is None
         return OpenCVDemosaicSource.FrameFacts(
+            linearizeParams=stored.linearizeParams,
+            workingSpace=stored.workingSpace,
             isGray=isGray,
-            is8Bit=image.dtype == np.uint8,
-            mosaicFamily=OpenCVDemosaicSource.guessMosaicFamily(image) if isGray else None,
+            is8Bit=stored.image.dtype == np.uint8 or self._recordedBits() == 8,
+            mosaicFamily=OpenCVDemosaicSource.guessMosaicFamily(stored.image) if guess else None,
         )
 
     @staticmethod
@@ -287,6 +378,14 @@ class OpenCVDemosaicSource(FrameSource):
         """Returns whether a frame has equal channels."""
         return image.ndim == 2 or (np.array_equal(image[:, :, 0], image[:, :, 1]) and
                                    np.array_equal(image[:, :, 1], image[:, :, 2]))
+
+    def _recordedBits(self) -> int | None:
+        """Returns the bit depth the frames were recorded at, when readStored widens them.
+
+        Returns:
+            The recorded depth, or None if frames are read at the depth they were recorded at.
+        """
+        return None
 
     @override
     def supportedDemosaicModes(self) -> list[DemosaicMode]:
@@ -300,7 +399,7 @@ class OpenCVDemosaicSource(FrameSource):
 
     @override
     def supportedDemosaicAlgorithms(self) -> list[DemosaicAlgorithm]:
-        """OpenCV's algorithms for gray frames; VNG only works on 8-bit frames."""
+        """OpenCV's algorithms for gray frames; VNG only works on 8-bit recordings."""
         first = self.firstFrameFacts
         if(not first.isGray):
             return []
@@ -309,13 +408,16 @@ class OpenCVDemosaicSource(FrameSource):
 
     @override
     def autoDemosaicParams(self, rememberedPattern: MosaicPattern | None = None) -> DemosaicParams | None:
-        """Gray frames are a mosaic when the pixel guess finds one, of the family member the user last picked or else
-        the family's first (RGGB or GRBG); the algorithm is Edge-aware.
+        """Gray frames are a mosaic of the pattern their file states, else when the pixel guess finds one, of the
+        family member the user last picked or else the family's first (RGGB or GRBG); the algorithm is Edge-aware.
         """
-        family = self.firstFrameFacts.mosaicFamily
-        if(family is None):
+        first = self.firstFrameFacts
+        if(first.isGray and first.linearizeParams.bayerPattern is not None):
+            pattern = first.linearizeParams.bayerPattern
+        elif(first.mosaicFamily is not None):
+            pattern = rememberedPattern if rememberedPattern in first.mosaicFamily else first.mosaicFamily[0]
+        else:
             return None
-        pattern = rememberedPattern if rememberedPattern in family else family[0]
         return DemosaicParams(pattern, DemosaicAlgorithm.EDGE_AWARE)
 
     @staticmethod
@@ -331,6 +433,9 @@ class OpenCVDemosaicSource(FrameSource):
         Returns:
             The family the pattern is in, or None if the frame isn't a mosaic.
         """
+        if(image.dtype not in (np.uint8, np.uint16)):
+            # Float frames are guessed from a 16-bit copy, since demosaicing needs integers
+            image = np.around(np.clip(image/max(float(image.max()), 1e-12), 0, 1)*65535).astype(np.uint16)
         rggb, grbg, gbrg, bggr = (
             OpenCVDemosaicSource.demosaic(
                 img=image,
@@ -378,17 +483,93 @@ class OpenCVDemosaicSource(FrameSource):
         return cv2.cvtColor(img, code)[2:h+2, 2:w+2]
 
     @override
-    def readFrame(self, index: int) -> np.ndarray | None:
-        """The stored frame is demosaiced with OpenCV."""
-        image = self.readStored(index)
-        return None if image is None else OpenCVDemosaicSource.demosaic(img=image, demosaicParams=self.demosaicParams)
+    def readFrame(self, index: int, atRecordedDepth: bool = False) -> Frame | None:
+        """Demosaiced frames are sensor data: the container's curve and primaries are ignored, and the levels the file
+        states are kept, else black is 0 and white is the type's maximum.
+        """
+        stored = self.readStored(index)
+        if(stored is None):
+            return None
+        image = self.toWorkingData(
+            image=stored.image,
+            demosaicParams=self.demosaicParams,
+            atRecordedDepth=atRecordedDepth,
+        )
+        return Frame(image, self.differsFromFirst(stored))
 
     @override
     def thumbnail(self) -> np.ndarray:
         """The first frame, demosaiced as Auto resolves."""
-        image = OpenCVDemosaicSource.demosaic(img=self.readStored(0), demosaicParams=self.autoDemosaicParams())
-        image = FrameSource.convertDepth(image=image, toDtype=np.uint8)
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        demosaicParams = self.autoDemosaicParams()
+        image = self.toWorkingData(image=self.readStored(0).image, demosaicParams=demosaicParams)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return ColorSpace.displayImage(img=image, workingSpace=self._workingSpaceFor(demosaicParams))
+
+    def toWorkingData(
+        self,
+        image: np.ndarray,
+        demosaicParams: DemosaicParams | None,
+        atRecordedDepth: bool = False,
+    ) -> np.ndarray:
+        """Turns a stored image into linear working data, linearized like the first frame.
+
+        Args:
+            image: The image as readStored returns it.
+            demosaicParams: The demosaic params; None if the image isn't demosaiced.
+            atRecordedDepth: Whether to round an image readStored widened back to the depth it was recorded at.
+
+        Returns:
+            The linear float32 BGR image.
+        """
+        linearizeParams = self.firstFrameFacts.linearizeParams
+        if(image.dtype == np.uint16 and self._recordedBits() == 8 and (atRecordedDepth or demosaicParams is not None)):
+            # Demosaic 8-bit video as 8-bit (VNG only works on uint8)
+            image = np.around(image/257).astype(np.uint8)
+        if(demosaicParams is None):
+            image = OpenCVDemosaicSource.demosaic(img=image, demosaicParams=None)
+        else:
+            image, linearizeParams = OpenCVDemosaicSource.sensorData(
+                image=image,
+                linearizeParams=linearizeParams,
+                demosaicParams=demosaicParams,
+            )
+        return linearize(img=image, linearizeParams=linearizeParams)
+
+    @staticmethod
+    def sensorData(
+        image: np.ndarray,
+        linearizeParams: LinearizeParams,
+        demosaicParams: DemosaicParams,
+    ) -> tuple[np.ndarray, LinearizeParams]:
+        """Demosaics stored values as a mosaic of sensor data, with no curve and no primaries.
+
+        Black is 0, since no source OpenCV demosaics states a black level. White is the level the file states (FITS),
+        else the type's maximum.
+
+        Args:
+            image: The stored image (BGR, or gray).
+            linearizeParams: The stored values' linearize params.
+            demosaicParams: The pattern and algorithm, which are not UNSPECIFIED.
+
+        Returns:
+            The demosaiced image (BGR) and its linearize params.
+        """
+        white = linearizeParams.whiteLevel
+        if(white is None):
+            white = float(np.iinfo(image.dtype).max) if np.issubdtype(image.dtype, np.integer) else 1.0
+        if(image.dtype not in (np.uint8, np.uint16)):
+            # OpenCV only demosaics integers
+            image = np.around(np.clip(image*(65535/white), 0, 65535)).astype(np.uint16)
+            white = 65535.0
+        image = OpenCVDemosaicSource.demosaic(img=image, demosaicParams=demosaicParams)
+        return (image, LinearizeParams(whiteLevel=white))
+
+    @override
+    def _workingSpaceFor(self, demosaicParams: DemosaicParams | None) -> ColorSpace.WorkingSpace:
+        """The first frame's working space, or one without primaries when the frames are demosaiced, since they are
+        sensor data.
+        """
+        return self.firstFrameFacts.workingSpace if demosaicParams is None else ColorSpace.UNTAGGED
 
 class ImageSequenceSource(OpenCVDemosaicSource):
     """A list of image files, one frame per file."""
@@ -404,27 +585,12 @@ class ImageSequenceSource(OpenCVDemosaicSource):
     @staticmethod
     @override
     def canOpen(path: str | list[str]) -> bool:
-        """Accepts an image file, or a list of one or more image files, but not raw camera files.
+        """Accepts an image file OpenCV reads, or a list of one or more of them, but not raw camera files.
 
-        Each file must be recognized, without decoding its pixels, by one of the readers
-        readStored decodes with, in its order: an image format OpenCV reads, then a FITS file
-        with image data.
+        Each file must be recognized without decoding its pixels.
         """
         paths = [path] if isinstance(path, str) else path
-        for file in paths:
-            if(CameraRawSource.isRaw(file)):
-                return False
-            if(cv2.haveImageReader(file)):
-                continue
-            try:
-                from astropy.io import fits
-                with fits.open(file) as hdus:
-                    if(any(hdu.header.get("NAXIS", 0) > 0 for hdu in hdus)):
-                        continue
-            except Exception:
-                pass
-            return False
-        return len(paths) > 0
+        return len(paths) > 0 and all(cv2.haveImageReader(file) and not CameraRawSource.isRaw(file) for file in paths)
 
     @override
     def filePaths(self) -> list[str]:
@@ -435,39 +601,112 @@ class ImageSequenceSource(OpenCVDemosaicSource):
         return len(self.paths)
 
     @override
-    def readStored(self, index: int) -> np.ndarray | None:
-        """FITS files are scaled to 16 bits."""
+    def readStored(self, index: int) -> StoredFrame | None:
+        """Each file is described by its own color tags."""
         if(index >= len(self.paths)):
             return None
-        return ImageSequenceSource._readImageFile(self.paths[index])
+        file = self.paths[index]
+        # Any depth and channel count, without alpha and with the EXIF orientation applied
+        img = cv2.imread(file, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
+        linearizeParams, workingSpace = ImageSequenceSource.describeImage(file=file)
+        return StoredFrame(ImageSequenceSource.toSupportedDtype(img), linearizeParams, workingSpace)
 
     @staticmethod
-    def _readImageFile(file: str) -> np.ndarray:
-        """Decodes an image file as an image OpenCV reads, else FITS.
+    def toSupportedDtype(img: np.ndarray) -> np.ndarray:
+        """Returns image data as uint8, uint16 or float32, the types the pipeline handles.
+
+        Other integer types are scaled from their maximum to 0-1 floats; floats are taken as 0-1 already.
 
         Args:
-            file: The image file.
+            img: The image as read.
 
         Returns:
-            The image. An image OpenCV reads keeps its stored depth and channels, and a FITS
-            image is stretched to the full 16-bit range.
+            The image as uint8, uint16 or float32.
         """
-        image = cv2.imread(file, cv2.IMREAD_UNCHANGED)
-        if image is not None:
-            return image
-        from astropy.io import fits
-
-        image = fits.getdata(file)
-        maxVal = np.iinfo(image.dtype).max if np.issubdtype(image.dtype, np.integer) else 1
-        maxOut = np.iinfo(np.uint16).max
-        image = (image.astype(np.float32) / maxVal) * maxOut
-        cv2.normalize(image, image, alpha=0, beta=maxOut, norm_type=cv2.NORM_MINMAX)
-        return image.astype(np.uint16)
+        if(img.dtype in (np.uint8, np.uint16)):
+            return img
+        if(np.issubdtype(img.dtype, np.integer)):
+            return (img.astype(np.float64)/np.iinfo(img.dtype).max).astype(np.float32)
+        return img.astype(np.float32)
 
     @override
     def frameSize(self) -> tuple[int, int]:
-        height, width = self.readStored(0).shape[:2]
+        height, width = self.readStored(0).image.shape[:2]
         return (width, height)
+
+    @staticmethod
+    def pngChunks(file: str) -> list[tuple[bytes, bytes]]:
+        """Returns the chunks of a PNG file before its first IDAT.
+
+        Args:
+            file: Path of the file.
+
+        Returns:
+            The chunks as (type, data), empty when the file isn't a PNG.
+        """
+        chunks = []
+        try:
+            for chunkType, data in pypng.Reader(filename=file).chunks():
+                if(chunkType == b"IDAT"):
+                    break
+                chunks.append((chunkType, data))
+        except pypng.Error:
+            pass
+        return chunks
+
+    @staticmethod
+    def fromPNGChunks(
+        chunks: list[tuple[bytes, bytes]],
+    ) -> tuple[ColorSpace.Transfer | None, ColorSpace.WorkingSpace] | None:
+        """Describes a PNG from its color chunks, with the precedence cICP > sRGB > cHRM/gAMA; iCCP is ignored.
+
+        Args:
+            chunks: The PNG's chunks before IDAT.
+
+        Returns:
+            The transfer curve to undo and the working space, or None when the PNG is untagged. A cHRM without gAMA
+            has the sRGB curve.
+        """
+        chunks = dict(chunks)
+        if(b"cICP" in chunks):
+            return ColorSpace.fromCICP(primaries=chunks[b"cICP"][0], transfer=chunks[b"cICP"][1])
+        if(b"sRGB" in chunks):
+            return (ColorSpace.SRGB_CURVE, ColorSpace.SRGB)
+        if(b"gAMA" in chunks or b"cHRM" in chunks):
+            workingSpace = ColorSpace.UNTAGGED
+            if(b"cHRM" in chunks):
+                v = np.array(struct.unpack(">8I", chunks[b"cHRM"][:32]))/100000
+                workingSpace = ColorSpace.fromPrimaries(primaries=v[2:8].reshape(3, 2), white=v[0:2])
+            transfer = ColorSpace.SRGB_CURVE
+            if(b"gAMA" in chunks):
+                gAMA = struct.unpack(">I", chunks[b"gAMA"][:4])[0]
+                if(gAMA == 45455 and workingSpace.toXYZ is None):
+                    return (ColorSpace.SRGB_CURVE, ColorSpace.SRGB)
+                elif(gAMA == 45455 and workingSpace == ColorSpace.SRGB):
+                    transfer = ColorSpace.SRGB_CURVE
+                elif(gAMA == 100000):
+                    transfer = None
+                elif(gAMA > 0):
+                    transfer = ("Gamma", 100000/gAMA)
+            return (transfer, workingSpace)
+        return None
+
+    @staticmethod
+    def describeImage(file: str) -> tuple[LinearizeParams, ColorSpace.WorkingSpace]:
+        """Describes a (non RAW, non FITS) image file from its color tags.
+
+        Only PNG color chunks are read; ICC profiles and EXIF aren't, so JPEGs and TIFFs are always untagged.
+
+        Args:
+            file: Path of the file.
+
+        Returns:
+            The linearize params and working space; untagged files are sRGB whatever their type, as PNG's
+            specification defaults them, and close to TIFF's default of gamma 2.2.
+        """
+        transfer, workingSpace = (ImageSequenceSource.fromPNGChunks(ImageSequenceSource.pngChunks(file))
+                                  or (ColorSpace.SRGB_CURVE, ColorSpace.SRGB))
+        return (LinearizeParams(transfer=transfer), workingSpace)
 
 class CameraRawSource(FrameSource):
     """A list of camera RAW files, one frame per file, decoded and demosaiced by LibRaw."""
@@ -485,8 +724,9 @@ class CameraRawSource(FrameSource):
         DemosaicAlgorithm.AAHD: "AAHD",
     }
 
-    class FrameFacts(NamedTuple):
-        """Hints about the inputs derived from one frame."""
+    @dataclass(frozen=True)
+    class FrameFacts(FrameSource.FrameFacts):
+        """Hints about the inputs derived from one frame, for LibRaw's demosaic."""
         sensorPattern: MosaicPattern | UNSPECIFIED | None  # The sensor's pattern, as readMosaicPattern reads it
 
     def __init__(self, path: str | list[str]) -> None:
@@ -535,14 +775,20 @@ class CameraRawSource(FrameSource):
 
     @override
     def frameSize(self) -> tuple[int, int]:
-        height, width = CameraRawSource.decodeRaw(file=self.paths[0]).shape[:2]
+        height, width = CameraRawSource.decodeRaw(file=self.paths[0]).image.shape[:2]
         return (width, height)
 
     @cached_property
+    @override
     def firstFrameFacts(self) -> CameraRawSource.FrameFacts:
         """What the first file says about the source, read from its metadata without decoding."""
         with rawpy.imread(self.paths[0]) as raw:
-            return CameraRawSource.FrameFacts(sensorPattern=CameraRawSource.readMosaicPattern(raw))
+            linearizeParams, workingSpace = CameraRawSource.fromRAW(raw)
+            return CameraRawSource.FrameFacts(
+                linearizeParams=linearizeParams,
+                workingSpace=workingSpace,
+                sensorPattern=CameraRawSource.readMosaicPattern(raw),
+            )
 
     @staticmethod
     def readMosaicPattern(raw: rawpy.RawPy) -> MosaicPattern | UNSPECIFIED | None:
@@ -583,12 +829,19 @@ class CameraRawSource(FrameSource):
         return None if pattern is None else DemosaicParams(pattern, UNSPECIFIED)
 
     @override
-    def readFrame(self, index: int) -> np.ndarray | None:
+    def readFrame(self, index: int, atRecordedDepth: bool = False) -> Frame | None:
         """LibRaw demosaics the frame, with the demosaic params' algorithm if they have one, else as it chooses."""
         if(index >= len(self.paths)):
             return None
         algorithm = UNSPECIFIED if self.demosaicParams is None else self.demosaicParams.algorithm
-        return CameraRawSource.decodeRaw(file=self.paths[index], algorithm=algorithm)
+        stored = CameraRawSource.decodeRaw(file=self.paths[index], algorithm=algorithm)
+        linear = linearize(img=stored.image, linearizeParams=self.firstFrameFacts.linearizeParams)
+        return Frame(linear, self.differsFromFirst(stored))
+
+    @override
+    def _workingSpaceFor(self, demosaicParams: DemosaicParams | None) -> ColorSpace.WorkingSpace:
+        """The camera's working space, whatever the demosaic params: LibRaw's demosaic keeps it."""
+        return self.firstFrameFacts.workingSpace
 
     @override
     def thumbnail(self) -> np.ndarray:
@@ -627,7 +880,7 @@ class CameraRawSource(FrameSource):
         return cv2.cvtColor(cv2.imdecode(np.frombuffer(thumb.data, np.uint8), flags), cv2.COLOR_BGR2RGB)
 
     @staticmethod
-    def decodeRaw(file: str, algorithm: DemosaicAlgorithm | UNSPECIFIED = UNSPECIFIED) -> np.ndarray:
+    def decodeRaw(file: str, algorithm: DemosaicAlgorithm | UNSPECIFIED = UNSPECIFIED) -> StoredFrame:
         """Decodes a raw camera file with LibRaw.
 
         Args:
@@ -635,23 +888,229 @@ class CameraRawSource(FrameSource):
             algorithm: The demosaic algorithm; UNSPECIFIED lets LibRaw choose.
 
         Returns:
-            The image as 16-bit BGR.
+            The stored image (BGR), its linearize params and its working space.
         """
         options = {}
         if(algorithm is not UNSPECIFIED):
             libRawAlgorithmName = CameraRawSource.LIBRAW_DEMOSAIC_ALGORITHMS[algorithm]
             options["demosaic_algorithm"] = rawpy.DemosaicAlgorithm[libRawAlgorithmName]
         with rawpy.imread(file) as raw:
-            img = raw.postprocess(output_bps=16, **options)
-        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            # user_black only keeps the common black level in; user_cblack keeps the per-channel offsets in too.
+            img = raw.postprocess(user_black=0,
+                                  user_cblack=[0, 0, 0, 0],
+                                  user_wb=list(CameraRawSource.asShotMultipliers(raw)),
+                                  adjust_maximum_thr=0,
+                                  output_color=rawpy.ColorSpace.raw,
+                                  gamma=(1, 1),
+                                  no_auto_bright=True,
+                                  output_bps=16,
+                                  **options)
+            linearizeParams, workingSpace = CameraRawSource.fromRAW(raw)
+        return StoredFrame(cv2.cvtColor(img, cv2.COLOR_RGB2BGR), linearizeParams, workingSpace)
+
+    @staticmethod
+    def rawRGBCam(raw: rawpy.RawPy) -> np.ndarray | None:
+        """Returns the camera -> linear sRGB matrix of a RAW file, whose rows sum to 1.
+
+        Args:
+            raw: The opened raw camera file.
+
+        Returns:
+            The 3×3 matrix from LibRaw's color_matrix (DNG) or rgb_xyz_matrix (its per-model table), or None when
+            LibRaw has neither.
+        """
+        colorMatrix = np.array(raw.color_matrix, dtype=np.float64)[:3, :3]
+        xyzToCam = np.array(raw.rgb_xyz_matrix, dtype=np.float64)[:3, :3]
+        if(np.any(colorMatrix)):
+            return colorMatrix
+        elif(np.any(xyzToCam)):
+            camRGB = xyzToCam @ ColorSpace.SRGB.toXYZ
+            camRGB /= camRGB.sum(axis=1, keepdims=True)
+            return np.linalg.inv(camRGB)
+        return None
+
+    @staticmethod
+    def asShotMultipliers(raw: rawpy.RawPy) -> np.ndarray:
+        """Returns the camera's as-shot white balance multipliers, normalized to green.
+
+        Args:
+            raw: The opened raw camera file.
+
+        Returns:
+            The four multipliers (R, G, B, G2), with G2 = G when the file gives none (Fuji); all 1 when the file
+            states no usable white balance.
+        """
+        multipliers = np.array(raw.camera_whitebalance, dtype=np.float64)
+        if(multipliers[3] == 0):
+            multipliers[3] = multipliers[1]
+        if(np.any(multipliers <= 0)):
+            return np.ones(4)
+        return multipliers/multipliers[1]
+
+    @staticmethod
+    def fromRAW(raw: rawpy.RawPy) -> tuple[LinearizeParams, ColorSpace.WorkingSpace]:
+        """Describes a RAW file decoded linear in camera RGB, balanced as shot and with its black level in.
+
+        Args:
+            raw: The opened raw camera file.
+
+        Returns:
+            The sensor levels, the as-shot multipliers LibRaw applied and the D65 reference multipliers, and the
+            camera's working space; UNTAGGED with a warning and no reference multipliers when LibRaw has no matrix.
+        """
+        black = [float(v) for v in raw.black_level_per_channel]
+        if(raw.num_colors == 3):
+            # LibRaw indexes 3-color levels by color as R, G1, B, G2 (its color_desc "RGBG"),
+            # regardless of the actual mosaic pattern in the file.
+            r, g1, b, g2 = black[0:4]
+            # Average the two greens, they're unlikely to be very different anyway.
+            blackLevel = (r, (g1 + g2)/2, b)
+        else:
+            # The black levels supplied by LibRaw are either unsupported, so just fallback
+            # to taking the average.
+            blackLevel = (float(np.mean(black)),)
+        asShot = CameraRawSource.asShotMultipliers(raw)
+        # LibRaw scales the multipliers so that the smallest maps the white level to 16 bits
+        applied = asShot/asShot.min()*65535/float(raw.white_level)
+        linearizeParams = LinearizeParams(
+            blackLevel=blackLevel,
+            whiteLevel=float(raw.white_level),
+            asShotMultipliers=tuple(float(v) for v in applied[:3]),
+        )
+        rgbCam = CameraRawSource.rawRGBCam(raw)
+        if(rgbCam is not None):
+            daylight = np.array(raw.daylight_whitebalance[:3], dtype=np.float64)
+            linearizeParams = dataclasses.replace(
+                linearizeParams,
+                daylightMultipliers=tuple(float(v) for v in daylight/daylight[1]),
+            )
+        else:
+            warnings.warn(
+                message="LibRaw has no color matrix for this camera, its colors are shown as sRGB",
+                category=ColorSpace.ColorWarning,
+            )
+            return (linearizeParams, ColorSpace.UNTAGGED)
+        return (linearizeParams, ColorSpace.WorkingSpace(toXYZ=ColorSpace.SRGB.toXYZ @ rgbCam))
+
+class FitsSource(ImageSequenceSource):
+    """A list of FITS files with image data, one frame per file, read by astropy."""
+
+    @staticmethod
+    @override
+    def canOpen(path: str | list[str]) -> bool:
+        """Accepts a FITS file with image data, or a list of one or more of them."""
+        paths = [path] if isinstance(path, str) else path
+        if(len(paths) == 0):
+            return False
+        try:
+            from astropy.io import fits
+            for file in paths:
+                with fits.open(file) as hdus:
+                    if(not any(hdu.header.get("NAXIS", 0) > 0 for hdu in hdus)):
+                        return False
+        except Exception:
+            return False
+        return True
+
+    @override
+    def readStored(self, index: int) -> StoredFrame | None:
+        """Frames are stored as float32 unless they are 8 or 16 bits; the file states the Bayer pattern and levels."""
+        if(index >= len(self.paths)):
+            return None
+        from astropy.io import fits
+        with fits.open(self.paths[index]) as hdus:
+            hdu = next(hdu for hdu in hdus if hdu.data is not None)
+            # astropy returns big-endian data, which OpenCV and the lookup tables would misread
+            img = np.asarray(hdu.data)
+            img = img.astype(img.dtype.newbyteorder("="))
+            header = hdu.header
+            if(img.ndim == 3):
+                # Color planes (RGB) first
+                img = np.ascontiguousarray(np.moveaxis(img[:3], 0, -1)[:, :, ::-1])
+            linearizeParams = FitsSource.fromFITS(header=header, data=img)
+        if(img.dtype not in (np.uint8, np.uint16)):
+            img = img.astype(np.float32)
+        return StoredFrame(img, linearizeParams, ColorSpace.UNTAGGED)
+
+    @staticmethod
+    def normalizeBayerPattern(
+        pattern: str,
+        xOffset: int = 0,
+        yOffset: int = 0,
+        bottomUp: bool = False,
+        height: int = 0,
+    ) -> MosaicPattern | None:
+        """Normalizes a FITS Bayer pattern to the pattern at the first stored pixel.
+
+        Args:
+            pattern: BAYERPAT, e.g. "RGGB".
+            xOffset: XBAYROFF, columns the pattern is shifted by.
+            yOffset: YBAYROFF, rows the pattern is shifted by.
+            bottomUp: Whether ROWORDER is BOTTOM-UP, so the pattern describes the image flipped vertically.
+            height: Image height, used for bottom-up images.
+
+        Returns:
+            The 2×2 pattern of the stored data, or None when the pattern isn't a 2×2 RGB one.
+        """
+        pattern = pattern.strip().upper()
+        if(len(pattern) != 4 or sorted(pattern) != ["B", "G", "G", "R"]):
+            return None
+        rows = [pattern[0:2], pattern[2:4]]
+        if(yOffset % 2):
+            rows = rows[::-1]
+        if(xOffset % 2):
+            rows = [row[::-1] for row in rows]
+        if(bottomUp and height % 2 == 0):
+            rows = rows[::-1]
+        result = rows[0] + rows[1]
+        if(result not in ("RGGB", "GRBG", "GBRG", "BGGR")):
+            return None
+        return MosaicPattern(result)
+
+    @staticmethod
+    def fromFITS(header: object, data: np.ndarray) -> LinearizeParams:
+        """Describes FITS data as sensor data: its Bayer pattern and levels.
+
+        Args:
+            header: The FITS header (astropy.io.fits.Header or a dict).
+            data: The (first frame's) data.
+
+        Returns:
+            The linearize params: no black level, since FITS has no standard keyword for one; white from DATAMAX or
+            SATURATE, else the integer type's maximum, else 1.0 for float data within 0-1 and 65535 otherwise.
+        """
+        bayerPattern = None
+        if("BAYERPAT" in header):
+            bayerPattern = FitsSource.normalizeBayerPattern(
+                pattern=str(header["BAYERPAT"]),
+                xOffset=int(header.get("XBAYROFF", 0)),
+                yOffset=int(header.get("YBAYROFF", 0)),
+                bottomUp=str(header.get("ROWORDER", "")).strip().upper() == "BOTTOM-UP",
+                height=data.shape[0],
+            )
+        if("DATAMAX" in header and float(header["DATAMAX"]) > 0):
+            white = float(header["DATAMAX"])
+        elif("SATURATE" in header and float(header["SATURATE"]) > 0):
+            white = float(header["SATURATE"])
+        elif(np.issubdtype(data.dtype, np.integer)):
+            white = float(np.iinfo(data.dtype).max)
+        elif(np.nanmin(data) >= 0 and np.nanmax(data) <= 1):
+            white = 1.0
+        else:
+            white = 65535.0
+        return LinearizeParams(bayerPattern=bayerPattern, whiteLevel=white)
 
 class VideoSource(OpenCVDemosaicSource):
-    """A video file read with cv2.VideoCapture.
+    """A video file decoded with PyAV, described by its stream's color tags.
 
-    Frame indexes always represent unique frames in the data stream, and that's
-    all consumers should care about. Under the hood, we map each unique frame
-    to their time and later use that time for seeking to the frame.
+    Frames are indexed by their position in presentation order and found by seeking to their
+    timestamps. Reading a frame less than a second after the last one read decodes forward
+    instead of seeking. The timestamps are read from the video's packets, without decoding,
+    the first time they are needed, and pickled so worker processes don't read them again.
     """
+
+    # CICP matrix coefficients codes, by the swscale matrix (an av.video.reformatter.Colorspace value) that decodes them
+    YUV_MATRICES = {1: 1, 4: 4, 5: 5, 6: 5, 7: 7, 9: 9, 10: 9}
 
     def __init__(self, path: str) -> None:
         """Initializes the source.
@@ -660,146 +1119,227 @@ class VideoSource(OpenCVDemosaicSource):
             path: The video file.
         """
         self.path = path
-        self.times: list[float] | None = None
-        self._capture: cv2.VideoCapture | None = None
-        self.nextPosition: int | None = 0
+        self.timestamps: list[int] | None = None
+        self.container: av.container.InputContainer | None = None
 
     def __getstate__(self) -> dict[str, object]:
-        """Pickles everything but the open capture, so each process opens its own file descriptor."""
-        state = self.__dict__.copy()
-        del state["_capture"]
-        return state
+        """Pickles the path, the timestamps, the first frame facts and the demosaic params, but not the open
+        container, so each process opens its own.
+        """
+        keep = ("path", "timestamps", "firstFrameFacts", "demosaicParams")
+        return {key: value for key, value in self.__dict__.items() if key in keep}
 
     def __setstate__(self, state: dict[str, object]) -> None:
-        """Restores a pickled source, which opens its capture when first read."""
+        """Restores a pickled source, which opens its container when first read."""
         self.__dict__.update(state)
-        self._capture = None
-        self.nextPosition = 0
+        self.container = None
 
     @staticmethod
     @override
     def canOpen(path: str | list[str]) -> bool:
-        """Accepts a single file OpenCV opens and reads at least two frames from.
+        """Accepts a single file PyAV demuxes at least two video frames from.
 
         One-frame videos are rejected, and left to other FrameSource implementations to handle.
         """
         if(not isinstance(path, str)):
             return False
-        capture = cv2.VideoCapture(path)
         try:
-            return capture.isOpened() and capture.read()[0] and capture.grab()
-        finally:
-            capture.release()
+            with av.open(path) as container:
+                stream = container.streams.video[0]
+                packets = 0
+                for packet in container.demux(stream):
+                    packets += packet.size > 0
+                    if(packets >= 2):
+                        return True
+        except Exception:
+            pass
+        return False
 
     @override
     def filePaths(self) -> list[str]:
         return [self.path]
 
-    @property
-    def capture(self) -> cv2.VideoCapture:
-        """The capture, opened at the first frame if it isn't open."""
-        if(self._capture is None):
-            self._capture = cv2.VideoCapture(self.path)
-            self.nextPosition = 0
-        return self._capture
+    def openContainer(self) -> None:
+        """Opens the video, if needed, and describes it from its stream's color tags."""
+        if(self.container is not None):
+            return
+        self.container = av.open(self.path)
+        self.stream = self.container.streams.video[0]
+        codec = self.stream.codec_context
+        self.width, self.height = codec.width, codec.height
+        self.videoBits = 8
+        formatName = ""
+        isYUV = True
+        if(codec.format is not None):
+            formatName = codec.format.name
+            self.videoBits = VideoSource.formatBits(codec.format)
+            isYUV = not codec.format.is_rgb and len(codec.format.components) >= 3
+        transfer, self.workingSpace = ColorSpace.fromVideoTags(primaries=codec.color_primaries,
+                                                               transfer=codec.color_trc,
+                                                               isYUV=isYUV)
+        self.linearizeParams = LinearizeParams(transfer=transfer)
+        self.yuvMatrix = VideoSource.YUV_MATRICES.get(codec.colorspace, 1) if isYUV else None
+        self.limitedRange = VideoSource.isLimitedRange(colorRange=codec.color_range,
+                                                       isYUV=isYUV,
+                                                       fullRangeFormat=formatName.startswith("yuvj"))
+        self.palette = VideoSource.readPalette(self.path) if formatName == "pal8" else None
+        self.decoder = None
+        self.lastTimestamp = None
+        self.lastFrame = None
 
-    def _frameTimes(self) -> list[float]:
-        """Returns the cached times of the frames.
+    @staticmethod
+    def isLimitedRange(colorRange: int | None, isYUV: bool, fullRangeFormat: bool) -> bool:
+        """Returns whether a stream's values are limited range, each missing tag falling back on its own.
 
-        The times are read by grabbing every frame sequentially the first time.
+        Args:
+            colorRange: FFmpeg color range (1 = limited, 2 = full, 0 or None = unspecified).
+            isYUV: Whether the pixel format is YUV (otherwise RGB or gray).
+            fullRangeFormat: Whether the pixel format itself is full range (yuvj*).
 
         Returns:
-            The frame times in milliseconds, in frame order.
+            Whether the range is limited. Untagged YUV is limited, as the codecs' specifications default it;
+            untagged RGB/gray is full range, as Windows takes bitmaps.
         """
-        if(self.times is None):
-            capture = cv2.VideoCapture(self.path)
-            try:
-                times = []
-                while(capture.grab()):
-                    times.append(capture.get(cv2.CAP_PROP_POS_MSEC))
-                self.times = times
-            finally:
-                capture.release()
-        return self.times
+        return colorRange == 1 or (isYUV and colorRange != 2 and not fullRangeFormat)
+
+    @staticmethod
+    def readPalette(path: str) -> np.ndarray:
+        """Returns the palette of a pal8 video.
+
+        Demuxers like AVI's attach the palette only to the first packet read, which opening the
+        video already reads and a seek discards, so frames decoded after a seek have an empty
+        palette. The first frame is decoded without seeking, in a container of its own.
+
+        Args:
+            path: The video file.
+
+        Returns:
+            The 256 entries as uint8 RGB.
+        """
+        with av.open(path) as container:
+            videoFrame = next(container.decode(video=0))
+        return np.frombuffer(videoFrame.planes[1], np.uint8).reshape(256, 4)[:, [2, 1, 0]]
+
+    @staticmethod
+    def formatBits(videoFormat: av.VideoFormat) -> int:
+        """Returns the bit depth of a video pixel format.
+
+        Args:
+            videoFormat: The pixel format.
+
+        Returns:
+            The depth of one sample; Bayer formats, whose components report a pseudo-depth, use
+            their name.
+        """
+        if(videoFormat.name.startswith("bayer_")):
+            return 16 if "16" in videoFormat.name else 8
+        return videoFormat.components[0].bits
+
+    def frameTimestamps(self) -> list[int]:
+        """Returns the presentation timestamps of the frames, read from the packets the first time.
+
+        Returns:
+            The sorted timestamps, in the stream's time base.
+        """
+        if(self.timestamps is None):
+            self.openContainer()
+            timestamps = set()
+            for packet in self.container.demux(self.stream):
+                timestamp = packet.pts if packet.pts is not None else packet.dts
+                if(timestamp is not None and packet.size > 0):
+                    timestamps.add(timestamp)
+            self.decoder = None
+            self.timestamps = sorted(timestamps)
+        return self.timestamps
 
     @override
     def frameCount(self) -> int:
-        """The count comes from grabbing every frame, since CAP_PROP_FRAME_COUNT is only the container's estimate."""
-        return len(self._frameTimes())
+        """The count is the number of distinct timestamps among the video's packets."""
+        return len(self.frameTimestamps())
 
-    def _seekBefore(self, index: int) -> None:
-        """Seeks to the frame, or to an earlier frame that reading forward reaches it from.
-
-        Usage: To find your desired frame at `index`, run _seekBefore() then sequentially
-        read frames until `self.nextPosition == index + 1`.
-
-        A naive approach that simply seeks to the time given by the index is NOT
-        guaranteed to make OpenCV return the expected frame.  Often, a seek + read() will
-        give you 2, 3 or even more frames into the future depending on how many missing
-        frames there are inside the file container. This is likely some combination of
-        file corruption and OpenCV bug.
+    def frameToImage(self, videoFrame: av.VideoFrame) -> np.ndarray:
+        """Converts a decoded frame to full range RGB, YUV with the stream's matrix and range.
 
         Args:
-            index: The frame's index.
-        """
-        times = self._frameTimes()
-        start = index
-        back = 1
-        while(True):
-            self.capture.set(cv2.CAP_PROP_POS_MSEC, times[start])
-            if(self.capture.grab()):
-                time: float = self.capture.get(cv2.CAP_PROP_POS_MSEC)
-                landed: int = bisect.bisect_left(times, time)
-                if(landed <= index):
-                    self.nextPosition = landed + 1
-                    return
-            if(start == 0):
-                break
-            start = max(0, index - back)
-            back *= 2
-        # We gave up on rewinding, so just close the capture. Callers will start searching from frame 0.
-        self.close()
-
-    @override
-    def readStored(self, index: int) -> np.ndarray | None:
-        # Skip seeking when the next frame is already what you want.
-        # This improves performance drastically.
-        shouldSeek = index != self.nextPosition
-        if(shouldSeek):
-            # Don't seek to some far off place beyond the end of the frame.
-            if(index >= len(self._frameTimes())):
-                return None
-            self._seekBefore(index)
-            if(self.nextPosition == index + 1):
-                return self._retrieve()
-        # Read forward to the desired frame.
-        while(self.capture.grab()):
-            currentPosition = self.nextPosition
-            self.nextPosition += 1
-            if(currentPosition == index):
-                return self._retrieve()
-        self.nextPosition = None
-        return None
-
-    def _retrieve(self) -> np.ndarray | None:
-        """Decodes the frame the capture last grabbed.
+            videoFrame: The decoded frame.
 
         Returns:
-            The frame, or None if it can't be decoded.
+            The full range uint16 BGR image.
         """
-        success, image = self.capture.retrieve()
-        if(not success):
-            self.nextPosition = None
+        if(self.yuvMatrix is not None):
+            image = videoFrame.reformat(format="rgb48le",
+                                        src_colorspace=self.yuvMatrix,
+                                        src_color_range=1 if self.limitedRange else 2).to_ndarray()
+        else:
+            # Converted at the source's bit depth and widened exactly, so untagged RGB/gray loads unchanged
+            sourceBits = 8 if VideoSource.formatBits(videoFrame.format) <= 8 else 16
+            if(self.palette is not None):
+                indices = np.frombuffer(videoFrame.planes[0], np.uint8).reshape(videoFrame.height, -1)
+                image = self.palette[indices[:, :videoFrame.width]]
+            else:
+                image = videoFrame.reformat(format="rgb24" if sourceBits == 8 else "rgb48le").to_ndarray()
+            if(sourceBits == 8):
+                image = image.astype(np.uint16)*257
+            if(self.limitedRange):
+                scaled = (image.astype(np.float32)/65535*255 - 16)/219
+                image = np.around(np.clip(scaled, 0, 1)*65535).astype(np.uint16)
+        return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+    @override
+    def readStored(self, index: int) -> StoredFrame | None:
+        """Frames are converted to 16-bit BGR, whatever the stream's depth."""
+        if(index == 0 and self.timestamps is None):
+            # Decoded in a container of its own, without reading every packet's timestamp, so thumbnails are quick
+            self.openContainer()
+            with av.open(self.path) as container:
+                videoFrame = next(container.decode(video=0), None)
+            if(videoFrame is None):
+                return None
+            return StoredFrame(
+                image=self.frameToImage(videoFrame),
+                linearizeParams=self.linearizeParams,
+                workingSpace=self.workingSpace,
+            )
+        timestamps = self.frameTimestamps()
+        if(index >= len(timestamps)):
             return None
-        return image
+        self.openContainer()
+        target = timestamps[index]
+        if(self.lastFrame is None or target != self.lastTimestamp):
+            if(self.decoder is None or self.lastTimestamp is None or target < self.lastTimestamp or
+               target - self.lastTimestamp > 1/self.stream.time_base):
+                self.container.seek(target, stream=self.stream, backward=True)
+                self.decoder = self.container.decode(self.stream)
+            self.lastFrame = None
+            for videoFrame in self.decoder:
+                timestamp = videoFrame.pts if videoFrame.pts is not None else videoFrame.dts
+                if(timestamp is not None and timestamp >= target):
+                    self.lastTimestamp = timestamp
+                    self.lastFrame = videoFrame
+                    break
+            if(self.lastFrame is None):
+                self.decoder = None
+                return None
+        if(self.lastTimestamp != target):
+            # The frame couldn't be decoded
+            return None
+        return StoredFrame(image=self.frameToImage(self.lastFrame),
+                           linearizeParams=self.linearizeParams,
+                           workingSpace=self.workingSpace)
+
+    @override
+    def _recordedBits(self) -> int | None:
+        self.openContainer()
+        return 8 if self.videoBits <= 8 else None
 
     @override
     def frameSize(self) -> tuple[int, int]:
-        return (int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        self.openContainer()
+        return (self.width, self.height)
 
     @override
     def close(self) -> None:
-        if(self._capture is not None):
-            self._capture.release()
-            self._capture = None
-            self.nextPosition = 0
+        if(self.container is not None):
+            self.container.close()
+            self.container = None
+

@@ -77,7 +77,7 @@ class Align:
         try:
             progress.setMessage("Aligning Frames")
             # Load Reference
-            ref = cv2.cvtColor(g.ui.reference, cv2.COLOR_BGR2GRAY)
+            ref = Video.alignImage(g.ui.reference)
             refOrig = ref
             
             # Dilate 
@@ -237,7 +237,8 @@ def align(frames: list[int],
     for c, frame in enumerate(frames):
         try:
             # Load Frame
-            movOrig = mov = cv2.cvtColor(video.getFrame(frame), cv2.COLOR_BGR2GRAY)
+            image = video.getFrame(index=frame)
+            movOrig = mov = Video.alignImage(image)
 
             # Dilate
             if(gCopy.dilate):

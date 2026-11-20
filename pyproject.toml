@@ -1,6 +1,9 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+filterwarnings = [
+    "ignore:\"Matplotlib\" related API features are not available",
+]
 
 [tool.ruff]
 line-length = 120
