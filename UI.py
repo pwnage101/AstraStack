@@ -11,11 +11,19 @@ import math
 import time
 from packaging import version
 from threading import Thread
+from enum import Enum
 
-from Constants import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from Preferences import Preferences
 from Video import Video, loadPsf
 from FrameSource import FrameSource
+from Constants import (
+    AUTO,
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    DemosaicAlgorithm,
+    DemosaicMode,
+    MosaicPattern,
+)
 from Align import Align, centerOfMass, dilateImg, normalizeImg
 from Stack import Stack, transform
 from Process import Process
@@ -38,11 +46,17 @@ class UI:
     VERSION = "2.5.1"
     SNAP_DIR = ""
     HOME_DIR = "~"
+
+    # The options of each demosaic drop-down, in order
+    DEMOSAIC_MODE_OPTIONS = (AUTO, *DemosaicMode)
+    MOSAIC_PATTERN_OPTIONS = (AUTO, *MosaicPattern)
+    DEMOSAIC_ALGORITHM_OPTIONS = (AUTO, *DemosaicAlgorithm)
     
     def __init__(self) -> None:
         self.preferences = Preferences()
         self.newVersionUrl = ""
         self.video = None
+        self.updatingDemosaic = False
         self.align = None
         self.stack = None
         self.process = None
@@ -64,7 +78,9 @@ class UI:
         self.preferencesDialog = self.builder.get_object("preferencesDialog")
         self.tabs = self.builder.get_object("tabs")
         self.cpus = self.builder.get_object("cpus")
-        self.colorMode = self.builder.get_object("colorMode")
+        self.demosaicMode = self.builder.get_object("demosaicMode")
+        self.mosaicPattern = self.builder.get_object("mosaicPattern")
+        self.demosaicAlgorithm = self.builder.get_object("demosaicAlgorithm")
         self.progressBox = self.builder.get_object("progressBox")
         self.progress = self.builder.get_object("progress")
         self.processSpinner = self.builder.get_object("processSpinner")
@@ -103,6 +119,14 @@ class UI:
             for extension in sorted(extensions):
                 fileFilter.add_pattern("*" + extension)
                 fileFilter.add_pattern("*" + extension.upper())
+
+        for combo in (self.demosaicMode, self.mosaicPattern, self.demosaicAlgorithm):
+            # Each item's text, and whether the loaded video supports it, which greys it out if not
+            combo.set_model(Gtk.ListStore(str, bool))
+            cell = Gtk.CellRendererText()
+            combo.pack_start(cell, True)
+            combo.add_attribute(cell, "text", 0)
+            combo.add_attribute(cell, "sensitive", 1)
 
         self.openDialog.set_preview_widget(Gtk.Image())
         self.saveDialog.set_preview_widget(Gtk.Image())
@@ -156,7 +180,9 @@ class UI:
         g.areaOfInterestP1 = (0, 0)
         g.areaOfInterestP2 = (0, 0)
         
-        g.guessedColorMode = Video.COLOR_RGB
+        g.demosaicModeChoice = AUTO
+        g.mosaicPatternChoice = AUTO
+        g.demosaicAlgorithmChoice = AUTO
         
         g.limit = 0
         
@@ -172,7 +198,7 @@ class UI:
         self.setThreads()
         self.checkNewVersion()
         self.setProgress()
-        self.setColorMode()
+        self.updateDemosaicChoices()
         self.setNormalize()
         self.setDilate()
         self.setAlignChannels()
@@ -370,10 +396,10 @@ class UI:
             try:
                 source = FrameSource.open(path)
                 try:
-                    img = Video(source).thumbnail()
+                    img = source.thumbnail()
                 finally:
                     source.close()
-                pixbuf = self.createPixbuf(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                pixbuf = self.createPixbuf(img)
             except Exception:
                 pass
         if(pixbuf is not None):
@@ -427,6 +453,12 @@ class UI:
             GLib.idle_add(showError)
             return
         frameCount = source.frameCount()
+        # pre-cache the supportedDemosaicModes.
+        try:
+            source.supportedDemosaicModes()
+        except Exception:
+            # Tolerate a corrupt first frame that supportedDemosaicModes() may try to read.
+            pass
         def load() -> None:
             """Loads the source: one frame goes straight to Process, more go through Align and Stack."""
             if(frameCount == 1):
@@ -444,6 +476,7 @@ class UI:
         try:
             g.source = source
             self.video = Video(source)
+            self.updateDemosaicChoices()
             self.video.checkMemory()
             thread = Thread(target=self.video.run, args=())
             thread.start()
@@ -459,17 +492,14 @@ class UI:
         g.source = source
         try:
             self.video = Video(source)
-            g.guessedColorMode = self.video.guessColorMode()
+            self.updateDemosaicChoices()
             self.video.checkMemory()
 
             self.window.set_title(self.sourceTitle() + " - " + UI.TITLE)
             self.saveDialog.set_current_name("")
 
-            self.updateAutoColorModeText()
-
             self.stack = None
-            self.process = Process(self.video.getFrame(index=0,
-                                                       colorMode=g.actualColor()))
+            self.process = Process(self.video.getFrame(index=0))
             self.builder.get_object("alignTab").set_sensitive(False)
             self.builder.get_object("stackTab").set_sensitive(False)
             self.builder.get_object("processTab").set_sensitive(True)
@@ -478,7 +508,6 @@ class UI:
             img = cv2.cvtColor(
                 self.video.getFrame(
                     index=0,
-                    colorMode=g.actualColor(),
                     toDtype=np.uint8,
                 ),
                 cv2.COLOR_BGR2RGB,
@@ -557,7 +586,6 @@ class UI:
             g.reference = self.video.sharpest
             self.frameSlider.set_value(self.video.sharpest)
 
-            self.updateAutoColorModeText()
             self.setReference()
             self.setStartFrame()
             self.setEndFrame()
@@ -595,36 +623,168 @@ class UI:
                 self.showErrorDialog("There was an error opening the PSF, make sure it is a valid image.  The PSF should be no larger than 100x100.")
             self.processImage(self.builder.get_object("deconvolveCustomFile"))
        
-    # Updates the Auto color mode text     
-    def updateAutoColorModeText(self):
-        colorMode = self.colorMode.get_active()
-        self.colorMode.remove(0)
-        if(g.guessedColorMode == Video.COLOR_RGB):
-            self.colorMode.prepend_text("Auto (RGB)")
-        elif(g.guessedColorMode == Video.COLOR_GRAYSCALE):
-            self.colorMode.prepend_text("Auto (Grayscale)")
-        elif(g.guessedColorMode == Video.COLOR_RGGB):
-            self.colorMode.prepend_text("Auto (RGGB)")
-        elif(g.guessedColorMode == Video.COLOR_GRBG):
-            self.colorMode.prepend_text("Auto (GRBG)")
-        elif(g.guessedColorMode == Video.COLOR_GBRG):
-            self.colorMode.prepend_text("Auto (GBRG)")
-        elif(g.guessedColorMode == Video.COLOR_BGGR):
-            self.colorMode.prepend_text("Auto (BGGR)")
-        elif(g.guessedColorMode == Video.COLOR_RGGB_VNG):
-            self.colorMode.prepend_text("Auto (RGGB VNG)")
-        elif(g.guessedColorMode == Video.COLOR_GRBG_VNG):
-            self.colorMode.prepend_text("Auto (GRBG VNG)")
-        elif(g.guessedColorMode == Video.COLOR_GBRG_VNG):
-            self.colorMode.prepend_text("Auto (GBRG VNG)")
-        elif(g.guessedColorMode == Video.COLOR_BGGR_VNG):
-            self.colorMode.prepend_text("Auto (BGGR VNG)")
-        if(colorMode == Video.COLOR_AUTO):
-            self.colorMode.set_active(0)
-        
+    def updateDemosaicChoices(self) -> None:
+        """Resolves the demosaic choice for the loaded video, and shows it in the three drop-downs.
+
+        Every option is listed. Before a video is loaded every option is offered; after, the ones the video doesn't
+        support are greyed out, a choice of one reverts to Auto, and each Auto item that is shown says what it
+        resolved to.
+        """
+        source = None if self.video is None else self.video.source
+        if(source is not None):
+            self.dropUnsupportedDemosaicChoices(source)
+            # Transfer the demosaic choices to the FrameSource state.
+            source.setDemosaicChoices(
+                mode=g.demosaicModeChoice,
+                pattern=g.mosaicPatternChoice,
+                algorithm=g.demosaicAlgorithmChoice,
+                rememberedPattern=self.rememberedPattern(),
+            )
+            if(self.stack is None):
+                # Process holds the frame as read with the old choices; processImage reads it again
+                self.process = None
+        self.showDemosaicChoices(source)
+
+    def dropUnsupportedDemosaicChoices(self, source: FrameSource) -> None:
+        """Reverts each demosaic choice the source doesn't support to Auto.
+
+        Args:
+            source: The loaded source.
+        """
+        if(g.demosaicModeChoice not in source.supportedDemosaicModes()):
+            g.demosaicModeChoice = AUTO
+        if(g.mosaicPatternChoice not in source.supportedMosaicPatterns()):
+            g.mosaicPatternChoice = AUTO
+        if(g.demosaicAlgorithmChoice not in source.supportedDemosaicAlgorithms()):
+            g.demosaicAlgorithmChoice = AUTO
+
+    def showDemosaicChoices(self, source: FrameSource | None) -> None:
+        """Shows the demosaic choices in the three drop-downs, greying out the options the source doesn't support.
+
+        Args:
+            source: The loaded source, which has resolved the choices; or None before one is loaded, when every
+                option is offered.
+        """
+        # Pattern and Algorithm only apply under On
+        enabled = g.demosaicModeChoice == DemosaicMode.ON
+        supportedModes = list(DemosaicMode)
+        supportedPatterns = list(MosaicPattern)
+        supportedAlgorithms = list(DemosaicAlgorithm)
+        modeAutoText = patternAutoText = algorithmAutoText = "Auto"
+        if(source is not None):
+            supportedModes = source.supportedDemosaicModes()
+            supportedPatterns = source.supportedMosaicPatterns()
+            supportedAlgorithms = source.supportedDemosaicAlgorithms()
+            # An Auto item says what it resolved to only where it is shown, never what Auto would pick instead
+            mode, pattern, algorithm = source.demosaicParamsDisplayNames()
+            if(g.demosaicModeChoice is AUTO):
+                modeAutoText = f"Auto ({mode})"
+            if(not enabled or g.mosaicPatternChoice is AUTO):
+                patternAutoText = f"Auto ({pattern})"
+            if(not enabled or g.demosaicAlgorithmChoice is AUTO):
+                algorithmAutoText = f"Auto ({algorithm})"
+        for label in ("mosaicPatternLabel", "demosaicAlgorithmLabel"):
+            self.builder.get_object(label).set_sensitive(enabled)
+        self.updatingDemosaic = True
+        try:
+            self.fillDemosaicChoices(
+                combo=self.demosaicMode,
+                options=UI.DEMOSAIC_MODE_OPTIONS,
+                supported=supportedModes,
+                autoText=modeAutoText,
+                value=g.demosaicModeChoice,
+                active=True,
+            )
+            self.fillDemosaicChoices(
+                combo=self.mosaicPattern,
+                options=UI.MOSAIC_PATTERN_OPTIONS,
+                supported=supportedPatterns,
+                autoText=patternAutoText,
+                value=g.mosaicPatternChoice,
+                active=enabled,
+            )
+            self.fillDemosaicChoices(
+                combo=self.demosaicAlgorithm,
+                options=UI.DEMOSAIC_ALGORITHM_OPTIONS,
+                supported=supportedAlgorithms,
+                autoText=algorithmAutoText,
+                value=g.demosaicAlgorithmChoice,
+                active=enabled,
+            )
+        finally:
+            self.updatingDemosaic = False
+
+    def fillDemosaicChoices(
+        self,
+        combo: Gtk.ComboBox,
+        options: tuple[Enum | AUTO, ...],
+        supported: list[Enum],
+        autoText: str,
+        value: Enum | AUTO,
+        active: bool,
+    ) -> None:
+        """Lists a demosaic drop-down's options, the unsupported ones greyed out.
+
+        Args:
+            combo: The drop-down.
+            options: Its options, AUTO first.
+            supported: The options the loaded video supports besides AUTO, which every video does.
+            autoText: The text of the AUTO item.
+            value: The option to select.
+            active: Whether the drop-down can be used; if not, it shows AUTO.
+        """
+        model = combo.get_model()
+        model.clear()
+        model.append([autoText, True])
+        for option in options[1:]:
+            model.append([option.value, option in supported])
+        combo.set_active(options.index(value) if active else 0)
+        combo.set_sensitive(active)
+
+    def setDemosaicMode(self, *args: object) -> None:
+        """Handler for the Demosaic drop-down: uses the choice and updates the preview.
+
+        Args:
+            *args: The signal's arguments, unused.
+        """
+        if(not self.updatingDemosaic):
+            g.demosaicModeChoice = UI.DEMOSAIC_MODE_OPTIONS[self.demosaicMode.get_active()]
+            self.updateDemosaicChoices()
+            self.updateImage()
+
+    def rememberedPattern(self) -> MosaicPattern | None:
+        """Returns the pattern the user last picked, which setMosaicPattern stores as a preference."""
+        try:
+            return MosaicPattern(self.preferences.get("lastMosaicPattern"))
+        except ValueError:
+            return None
+
+    def setMosaicPattern(self, *args: object) -> None:
+        """Handler for the Pattern drop-down: uses the choice, remembers an explicit one and updates the preview.
+
+        Args:
+            *args: The signal's arguments, unused.
+        """
+        if(not self.updatingDemosaic):
+            g.mosaicPatternChoice = UI.MOSAIC_PATTERN_OPTIONS[self.mosaicPattern.get_active()]
+            if(g.mosaicPatternChoice is not AUTO):
+                self.preferences.set("lastMosaicPattern", g.mosaicPatternChoice.value)
+            self.updateDemosaicChoices()
+            self.updateImage()
+
+    def setDemosaicAlgorithm(self, *args: object) -> None:
+        """Handler for the Algorithm drop-down: uses the choice and updates the preview.
+
+        Args:
+            *args: The signal's arguments, unused.
+        """
+        if(not self.updatingDemosaic):
+            g.demosaicAlgorithmChoice = UI.DEMOSAIC_ALGORITHM_OPTIONS[self.demosaicAlgorithm.get_active()]
+            self.updateDemosaicChoices()
+            self.updateImage()
+
     # Called when the tab is changed.  Updates parts of the UI based on the tab
     def changeTab(self, notebook, page, page_num, user_data=None):
-        self.colorMode.set_sensitive(True)
         if((page_num == UI.LOAD_TAB or page_num == UI.ALIGN_TAB) and self.video is not None):
             self.setStartFrame()
             self.setEndFrame()
@@ -640,7 +800,6 @@ class UI:
             self.updateImage(None, page_num)
         elif(page_num == UI.PROCESS_TAB and self.process is not None):
             self.frameScale.hide()
-            self.colorMode.set_sensitive(False)
             self.processImage()
         self.fixFrameSliderBug()
     
@@ -659,12 +818,11 @@ class UI:
             videoIndex = int(self.frameSlider.get_value())
             if(len(self.video.frames) == 0):
                 # Single Image
-                img = cv2.cvtColor(self.video.getFrame(index=0, colorMode=g.actualColor()), cv2.COLOR_BGR2RGB)
+                img = cv2.cvtColor(self.video.getFrame(index=0), cv2.COLOR_BGR2RGB)
             else:
                 # Video/Sequence
                 videoIndex = min(videoIndex, len(self.video.frames)-1)
-                img = cv2.cvtColor(self.video.getFrame(self.video.frames[videoIndex], g.actualColor()),
-                                   cv2.COLOR_BGR2RGB)
+                img = cv2.cvtColor(self.video.getFrame(self.video.frames[videoIndex]), cv2.COLOR_BGR2RGB)
                 
             height, width = img.shape[:2]
             
@@ -707,7 +865,6 @@ class UI:
             M = tmat[1]
             img = self.video.getFrame(
                 index=videoIndex,
-                colorMode=g.actualColor(),
                 toDtype=np.uint8,
             )
             if(g.autoCrop):
@@ -931,7 +1088,7 @@ class UI:
     # Sets the reference frame to the current visible frame
     def setReference(self, *args: object) -> None:
         g.reference = str(int(self.frameSlider.get_value()))
-        self.reference = self.video.getFrame(self.video.frames[int(g.reference)], g.actualColor())
+        self.reference = self.video.getFrame(self.video.frames[int(g.reference)])
         self.builder.get_object("referenceLabel").set_text(g.reference)
         self.builder.get_object("alignButton").set_sensitive(True)
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
@@ -958,7 +1115,7 @@ class UI:
             # Reference is outside of the range, fix it
             g.reference = str(int(g.startFrame))
             self.builder.get_object("referenceLabel").set_text(g.reference)
-            self.reference = self.video.getFrame(self.video.frames[int(g.reference)], g.actualColor())
+            self.reference = self.video.getFrame(self.video.frames[int(g.reference)])
         self.fixFrameSliderBug()
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
             self.updateImage()
@@ -973,7 +1130,7 @@ class UI:
             # Reference is outside of the range, fix it
             g.reference = str(int(g.endFrame))
             self.builder.get_object("referenceLabel").set_text(g.reference)
-            self.reference = self.video.getFrame(self.video.frames[int(g.reference)], g.actualColor())
+            self.reference = self.video.getFrame(self.video.frames[int(g.reference)])
         self.fixFrameSliderBug()
         if(self.tabs.get_current_page() == UI.ALIGN_TAB):
             self.updateImage()
@@ -1086,21 +1243,6 @@ class UI:
     # Sets whether or not to align channels separately
     def setAlignChannels(self, *args):
         g.alignChannels = self.alignChannels.get_active()
-    
-    # Sets the color mode of the input
-    def setColorMode(self, *args):
-        if(self.colorMode.is_sensitive()):
-            g.colorMode = self.colorMode.get_active()
-            if(g.colorMode == Video.COLOR_RGGB or
-               g.colorMode == Video.COLOR_GRBG or
-               g.colorMode == Video.COLOR_GRBG or
-               g.colorMode == Video.COLOR_BGGR or
-               g.colorMode == Video.COLOR_RGGB_VNG or
-               g.colorMode == Video.COLOR_GRBG_VNG or
-               g.colorMode == Video.COLOR_GRBG_VNG or
-               g.colorMode == Video.COLOR_BGGR_VNG):
-                self.preferences.set("bayerGuess", g.colorMode)
-            self.updateImage()
     
     def setDriftType(self, *args):
         g.driftType = self.driftType.get_active()
@@ -1344,8 +1486,9 @@ class UI:
             if(self.stack is not None):
                 self.process = Process(self.stack.stackedImage)
             else:
-                self.process = Process(self.video.getFrame(index=0,
-                                                           colorMode=g.actualColor()))
+                self.process = Process(self.video.getFrame(index=0))
+            # A thread still running is processing the replaced image, so the new one needs its own
+            self.processThread = None
         if(self.processThread != None and self.processThread.is_alive()):
             self.process.processAgain = processAgain
             self.process.processDeblurAgain = processDeblur
@@ -1359,6 +1502,9 @@ class UI:
     # Called when processing is complete
     def finishedProcessing(self, *args):
         def update():
+            if(self.process is None):
+                # The image was dropped while it was processed
+                return
             if(self.showMask.get_active() and self.process.thresh is not None):
                 pixbuf = self.createPixbuf(np.around(self.process.thresh*255).astype('uint8'))
             else:

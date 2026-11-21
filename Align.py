@@ -237,7 +237,7 @@ def align(frames: list[int],
     for c, frame in enumerate(frames):
         try:
             # Load Frame
-            movOrig = mov = cv2.cvtColor(video.getFrame(frame, gCopy.actualColor()), cv2.COLOR_BGR2GRAY)
+            movOrig = mov = cv2.cvtColor(video.getFrame(frame), cv2.COLOR_BGR2GRAY)
 
             # Dilate
             if(gCopy.dilate):

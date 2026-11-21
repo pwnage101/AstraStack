@@ -645,7 +645,7 @@
                     <property name="margin-right">5</property>
                     <signal name="switch-page" handler="changeTab" swapped="no"/>
                     <child>
-                      <!-- n-columns=2 n-rows=2 -->
+                      <!-- n-columns=2 n-rows=6 -->
                       <object class="GtkGrid" id="loadTab">
                         <property name="visible">True</property>
                         <property name="can-focus">False</property>
@@ -654,6 +654,7 @@
                         <property name="margin-top">10</property>
                         <property name="margin-bottom">10</property>
                         <property name="row-spacing">5</property>
+                        <property name="column-spacing">5</property>
                         <property name="column-homogeneous">True</property>
                         <child>
                           <object class="GtkButton" id="openFile">
@@ -681,6 +682,101 @@
                             <property name="left-attach">0</property>
                             <property name="top-attach">0</property>
                             <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="margin-top">10</property>
+                            <property name="tooltip-text" translatable="yes">Whether the frames are a mosaic of single-color pixels (raw sensor data), which is turned into a color image by demosaicing.
+
+Auto: Demosaic if the file is a mosaic, as far as it can tell.
+
+Off: Never demosaic.  Use this if Auto wrongly guesses that the frames are a mosaic.
+
+On: Always demosaic.</property>
+                            <property name="label" translatable="yes">Demosaic</property>
+                            <attributes>
+                              <attribute name="weight" value="bold"/>
+                            </attributes>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">2</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkComboBox" id="demosaicMode">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <signal name="changed" handler="setDemosaicMode" swapped="no"/>
+                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">3</property>
+                            <property name="width">2</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="mosaicPatternLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="tooltip-text" translatable="yes">The arrangement of the red, green and blue pixels of the mosaic.
+
+Auto uses the pattern the file states, or else guesses it.  Auto can't tell RGGB from BGGR, or GRBG from GBRG, so it picks the one you last chose here.</property>
+                            <property name="label" translatable="yes">Pattern</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">4</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="demosaicAlgorithmLabel">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <property name="tooltip-text" translatable="yes">The method used to fill in the two colors each pixel of the mosaic is missing.
+
+- Edge-aware: Very fast, and sharp along edges.  Suits most recordings.
+- Bilinear: Very fast, but the softest.
+- VNG: Slow, but with fewer color fringes.
+- PPG: Fast, and sharper than Bilinear.
+- AHD: Fast, with few color fringes and maze patterns.  A good general choice.
+- DCB: Slow, but keeps fine detail with few artifacts.
+- DHT: Slow, but sharp, with clean diagonal edges.
+- AAHD: Slowest, but like AHD with fewer artifacts in fine detail.</property>
+                            <property name="label" translatable="yes">Algorithm</property>
+                          </object>
+                          <packing>
+                            <property name="left-attach">1</property>
+                            <property name="top-attach">4</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkComboBox" id="mosaicPattern">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <signal name="changed" handler="setMosaicPattern" swapped="no"/>
+                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">0</property>
+                            <property name="top-attach">5</property>
+                          </packing>
+                        </child>
+                        <child>
+                          <object class="GtkComboBox" id="demosaicAlgorithm">
+                            <property name="visible">True</property>
+                            <property name="can-focus">False</property>
+                            <signal name="changed" handler="setDemosaicAlgorithm" swapped="no"/>
+                            <signal name="scroll-event" handler="propagateScroll" swapped="no"/>
+                          </object>
+                          <packing>
+                            <property name="left-attach">1</property>
+                            <property name="top-attach">5</property>
                           </packing>
                         </child>
                       </object>
@@ -3086,20 +3182,6 @@ Note: Drift adjustment will still crop the image.</property>
                       </packing>
                     </child>
                     <child>
-                      <object class="GtkLabel">
-                        <property name="width-request">50</property>
-                        <property name="visible">True</property>
-                        <property name="can-focus">False</property>
-                        <property name="margin-left">10</property>
-                        <property name="label" translatable="yes">Color:</property>
-                      </object>
-                      <packing>
-                        <property name="expand">False</property>
-                        <property name="fill">True</property>
-                        <property name="position">2</property>
-                      </packing>
-                    </child>
-                    <child>
                       <object class="GtkBox">
                         <property name="visible">True</property>
                         <property name="can-focus">False</property>
@@ -3151,33 +3233,7 @@ Note: Drift adjustment will still crop the image.</property>
                         <property name="expand">False</property>
                         <property name="fill">True</property>
                         <property name="pack-type">end</property>
-                        <property name="position">3</property>
-                      </packing>
-                    </child>
-                    <child>
-                      <object class="GtkComboBoxText" id="colorMode">
-                        <property name="visible">True</property>
-                        <property name="can-focus">False</property>
-                        <property name="active">0</property>
-                        <items>
-                          <item id="0" translatable="yes">Auto</item>
-                          <item id="1" translatable="yes">RGB</item>
-                          <item id="2" translatable="yes">Grayscale</item>
-                          <item id="3" translatable="yes">Bayer RGGB</item>
-                          <item id="4" translatable="yes">Bayer GRBG</item>
-                          <item id="5" translatable="yes">Bayer GBRG</item>
-                          <item id="6" translatable="yes">Bayer BGGR</item>
-                          <item id="7" translatable="yes">Bayer RGGB (VNG)</item>
-                          <item id="8" translatable="yes">Bayer GRBG (VNG)</item>
-                          <item id="9" translatable="yes">Bayer GBRG (VNG)</item>
-                          <item id="10" translatable="yes">Bayer BGGR (VNG)</item>
-                        </items>
-                        <signal name="changed" handler="setColorMode" swapped="no"/>
-                      </object>
-                      <packing>
-                        <property name="expand">False</property>
-                        <property name="fill">True</property>
-                        <property name="position">4</property>
+                        <property name="position">2</property>
                       </packing>
                     </child>
                   </object>
