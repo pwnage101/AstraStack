@@ -1,5 +1,5 @@
-pyinstaller==6.16.0
+pyinstaller==6.22.3
 behave
 pytest==9.2.0
-ruff==0.17.4
+ruff==0.17.6
 ddt==1.7.2
